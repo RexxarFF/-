@@ -16,6 +16,12 @@ class GroupRequestTests(unittest.TestCase):
         self.assertEqual(parse_group_request("Какое расписание уроков на сегодня"), ("schedule", "today"))
         self.assertEqual(parse_group_request("расписание на всю неделю"), ("week", "today"))
 
+    def test_interactive_phrases_are_recognized_explicitly(self):
+        self.assertEqual(parse_group_request("Моя статистика?"), ("stats", "today"))
+        self.assertEqual(parse_group_request("мои огоньки"), ("pairs", "today"))
+        self.assertEqual(parse_group_request("Интерактив"), ("pairs", "today"))
+        self.assertIsNone(parse_group_request("У нас хорошая статистика"))
+
     def test_unrelated_conversation_does_not_trigger_bot(self):
         for text in ("Завтра сделаю дз", "Никто не знает, что задано на завтра? Я потом уточню", "Привет", "", "@all"):
             with self.subTest(text=text):

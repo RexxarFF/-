@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 if __name__ == "__main__":
-    print("[ClassDiary 0.2.1] classdiary.app: starting", flush=True)
+    print("[ClassDiary 0.2.3] classdiary.app: starting", flush=True)
 
 import asyncio
 import calendar
@@ -14,7 +14,8 @@ from datetime import date, datetime, timedelta, timezone
 
 from .config import ROOT, Config, get_timezone, today_in
 from .db import Database
-from .group_requests import GROUP_COMMANDS, parse_command, parse_group_request
+from .group_requests import GROUP_COMMANDS, VIEW_COMMANDS, parse_command, parse_group_request
+from .group_interactive import GroupInteractive, PUBLIC_VIEWS
 from .panel import PanelTelegram
 from .schedule import DAYS, SHORT_DAYS, parse_date, parse_day
 from .service import AccessDenied, Diary, PERMISSIONS
@@ -29,6 +30,7 @@ class Application:
         self.config, self.db = config, db
         self.tg = PanelTelegram(telegram, db)
         self.diary = Diary(db)
+        self.group_interactive = GroupInteractive(self)
         self.username = ""
         self.bot_id = 0
 
@@ -85,9 +87,9 @@ class Application:
             if message.get("sender_chat"):
                 if command in GROUP_COMMANDS or parse_group_request(message.get("text", "")):
                     try:
-                        await self.tg.send(message["chat"]["id"], "Сообщение отправлено от имени группы или канала. "
+                        await self.send_group(message, "Сообщение отправлено от имени группы или канала. "
                                            "Переключитесь на свой личный аккаунт и повторите запрос: "
-                                           "так бот сможет проверить доступ к классу и ответить вам в личку.")
+                                           "так бот сможет проверить доступ к классу и показать ответ.")
                     except TelegramError as exc:
                         log.warning("Group reply failed: chat_id=%s code=%s", message["chat"]["id"], exc.code)
                 return
@@ -98,14 +100,25 @@ class Application:
         query = update.get("callback_query", {})
         origin = query.get("message", {})
         adopt = origin.get("message_id") if origin.get("chat", {}).get("type") == "private" and origin.get("text") and not query.get("data", "").startswith("ack:") else None
-        token = await self.tg.begin(int(user["id"]), adopt)
+        source_chat = (origin if query else message).get("chat", {})
+        fresh = source_chat.get("type") in ("group", "supergroup")
+        if fresh:
+            parts = query.get("data", "").split(":")
+            command, _ = parse_command(message.get("text", ""), self.username)
+            requested = VIEW_COMMANDS.get(command) or parse_group_request(message.get("text", ""))
+            if parts[0] == "g" or (parts[0] == "v" and len(parts) > 2 and parts[2] in PUBLIC_VIEWS) or (not query and requested and requested[0] in PUBLIC_VIEWS):
+                return await self.handle_update(update)
+        token = await self.tg.begin(int(user["id"]), adopt, fresh_message=fresh)
         try:
             await self.handle_update(update)
         finally:
             try:
                 stage, _ = self.db.state(int(user["id"]))
                 if stage not in ("pick_members", "pick_group"):
-                    await self.tg.close_keyboard(int(user["id"]))
+                    try:
+                        await self.tg.close_keyboard(int(user["id"]))
+                    except TelegramError as exc:
+                        log.warning("Temporary keyboard cleanup failed: user_id=%s code=%s", user["id"], exc.code)
             finally:
                 self.tg.end(token)
 
@@ -128,7 +141,8 @@ class Application:
             elif update.get("message", {}).get("text", "").startswith("/"):
                 await self.tg.send(update["message"]["chat"]["id"], e(message))
         except TelegramError as exc:
-            log.warning("Telegram request failed: code=%s", exc.code)
+            origin = update.get("callback_query", {}).get("message") or update.get("message", {})
+            log.warning("Telegram request failed: chat_id=%s code=%s retry_after=%s", origin.get("chat", {}).get("id"), exc.code, exc.retry_after)
             callback = update.get("callback_query")
             if callback:
                 try:
@@ -158,7 +172,7 @@ class Application:
                 self.diary.select_class(uid, classroom["id"])
             elif command == "/start" and payload.startswith("v_"):
                 parts = payload.split("_")
-                if len(parts) != 4 or parts[2] not in ("hw", "mine", "schedule", "week", "stats"):
+                if len(parts) != 4 or parts[2] not in ("hw", "mine", "schedule", "week", "stats", "pairs"):
                     raise ValueError("Неверная ссылка.")
                 return await self.view(uid, int(parts[1]), parts[2], parts[3])
             return await self.home(uid)
@@ -172,12 +186,12 @@ class Application:
             return await self.shared_users(uid, message["users_shared"])
         if "chat_shared" in message:
             return await self.shared_chat(uid, message["chat_shared"])
-        shortcuts = {"/hw": "hw", "/tomorrow": "hw", "/schedule": "week", "/my": "mine", "/stats": "stats"}
-        if command in shortcuts:
+        if command in VIEW_COMMANDS:
             userrow = self.db.one("SELECT active_class FROM users WHERE id=?", (uid,))
             if not userrow or not userrow["active_class"]:
                 return await self.home(uid)
-            return await self.view(uid, userrow["active_class"], shortcuts[command], "tomorrow")
+            kind, target = VIEW_COMMANDS[command]
+            return await self.view(uid, userrow["active_class"], kind, target)
         stage, data = self.db.state(uid)
         if stage:
             return await self.state_message(uid, message, stage, data)
@@ -194,9 +208,9 @@ class Application:
                            "📎 Откройте задание, чтобы получить фото и файлы.\n"
                            "🔥 Серия растёт за дни общения в привязанной группе.\n\n"
                            "/menu — меню; /cancel — отменить ввод; /hw — общее ДЗ; /my — личные записи; "
-                           "/schedule — расписание недели; /stats — статистика.\n\n"
+                           "/schedule — расписание недели; /stats — статистика; /pairs — огоньки.\n\n"
                            "/groupcheck — проверка привязки и настроек доступа бота в группе.\n\n"
-                           "В группе напишите «что задано на завтра» — ответ откроется в личке.\n"
+                           "В группе статистика и огоньки показываются здесь же. ДЗ и расписание приходят в личку.\n"
                            f"Старые задания удаляются через {self.config.homework_retention_days} дней после записи, когда дата выполнения уже прошла.",
                            kb([b("В меню", "classes")]))
 
@@ -219,42 +233,87 @@ class Application:
                 raise AccessDenied("Привязать группу может её администратор.")
             self.diary.bind_group(target["id"], uid, chat_id, message["chat"].get("title", "Группа"))
             classroom = self.diary.require(target["id"], uid)
-            await self.tg.send(chat_id, f"🏫 Группа привязана к классу <b>{e(classroom['name'])}</b>.\n"
+            await self.send_group(message, f"🏫 Группа привязана к классу <b>{e(classroom['name'])}</b>.\n"
                                "Для счётчика сообщений назначьте бота администратором или отключите Privacy Mode через @BotFather.")
-        shortcuts = {"/hw": "hw", "/tomorrow": "hw", "/schedule": "week", "/stats": "stats"}
-        request = (shortcuts[command], "tomorrow") if command in shortcuts else parse_group_request(message.get("text", ""))
+        request = VIEW_COMMANDS.get(command) or parse_group_request(message.get("text", ""))
         if command == "/groupcheck":
             return await self.group_check(message, classroom)
         if not classroom:
             if command in GROUP_COMMANDS or request:
-                await self.tg.send(chat_id, "✅ Бот получил сообщение из этой группы.\n\n"
+                await self.send_group(message, "✅ Бот получил сообщение из этой группы.\n\n"
                                    "Группа пока не привязана к классу. Владелец класса должен открыть бота в личке: "
                                    "«Управление классом → Привязать группу → Выбрать существующую группу».",
                                    kb([b("Открыть бота", url=f"https://t.me/{self.username}?start=group")]))
             return
         if command == "/help":
-            return await self.tg.send(chat_id, "Команды группы: /menu, /hw, /schedule, /stats, /groupcheck.\n"
-                                      "Также можно написать «что задано на завтра». Ответ с заданиями открывается в личке.")
+            return await self.send_group(message, "Статистика и интерактив: /stats, /pairs, /interactive — ответы здесь, в группе.\n"
+                                         "ДЗ, личные записи и расписание: /hw, /my, /schedule — ответы в личку.\n"
+                                         "Меню: /menu. Проверка: /groupcheck.")
         if request:
             kind, target = request
-            try:
-                self.diary.require(classroom["id"], uid)
-                await self.view(uid, classroom["id"], kind, target)
-                log.info("Group request handled: chat_id=%s destination=private", chat_id)
-            except (TelegramError, AccessDenied):
-                await self.tg.send(chat_id, "Откройте бота в личке. Доступ получают участники, которых добавил владелец класса.",
-                                   kb([b("Открыть бота", url=f"https://t.me/{self.username}?start=v_{classroom['id']}_{kind}_{target}")]))
-            return
+            if kind in PUBLIC_VIEWS:
+                return await self.group_interactive.show(uid, classroom["id"], kind, message)
+            return await self.group_private_answer(message, uid, classroom["id"], kind, target)
         if command in ("/menu", "/start"):
-            await self.tg.send(chat_id, f"🏫 <b>{e(classroom['name'])}</b>\nОтвет придёт вам в личку.",
-                               kb([b("📚 Общее ДЗ на завтра", f"v:{classroom['id']}:hw:tomorrow")],
-                                  [b("📅 Расписание недели", f"v:{classroom['id']}:week:today")],
-                                  [b("📊 Моя статистика", f"v:{classroom['id']}:stats:today")],
-                                  [b("Открыть бота", url=f"https://t.me/{self.username}?start=c_{classroom['invite_token']}")]))
+            rows = [[b("📚 Общее ДЗ на завтра", f"v:{classroom['id']}:hw:tomorrow")],
+                    [b("📅 Расписание недели", f"v:{classroom['id']}:week:today")]]
+            if classroom["interactive"]:
+                rows.append([b("📊 Статистика", f"v:{classroom['id']}:stats:today"), b("🔥 Огоньки", f"v:{classroom['id']}:pairs:today")])
+            rows.append([b("Открыть бота", url=f"https://t.me/{self.username}?start=c_{classroom['invite_token']}")])
+            interactive_hint = "📊 Статистика и огоньки — в группе." if classroom["interactive"] else "Интерактив выключен владельцем класса."
+            await self.send_group(message, f"🏫 <b>{e(classroom['name'])}</b>\n{interactive_hint}\n📚 ДЗ и расписание — в личку.",
+                                  {"inline_keyboard": rows})
+
+    async def send_group(self, message, text, keyboard=None):
+        options = {}
+        if message.get("message_thread_id"):
+            options["message_thread_id"] = message["message_thread_id"]
+        if message.get("message_id"):
+            options["reply_parameters"] = {"message_id": message["message_id"], "allow_sending_without_reply": True}
+        return await self.tg.send(message["chat"]["id"], text, keyboard, **options)
+
+    @staticmethod
+    def private_error(exc):
+        if isinstance(exc, AccessDenied):
+            return "access", str(exc)
+        if exc.code == 429:
+            return "rate_limit", f"Telegram ограничил частоту отправки. Повторите запрос через {max(1, exc.retry_after)} сек."
+        if exc.code in (0, 500, 502, 503, 504):
+            return "network", "Telegram не подтвердил доставку ответа. Повторите запрос немного позже."
+        if exc.code == 403 or (exc.code == 400 and "chat not found" in exc.description.casefold()):
+            return "private_unavailable", "Не могу отправить ответ в личку. Откройте бота, разблокируйте его при необходимости и нажмите /start."
+        return "telegram_error", "Не удалось сформировать или отправить ответ. Откройте его по кнопке ниже. Ошибка записана в журнал."
+
+    async def group_private_answer(self, message, uid, cid, kind, target, callback_id=None):
+        try:
+            self.diary.require(cid, uid)
+            await self.view(uid, cid, kind, target)
+        except (TelegramError, AccessDenied) as exc:
+            category, explanation = self.private_error(exc)
+            log.warning("Group private reply failed: chat_id=%s user_id=%s reason=%s code=%s retry_after=%s",
+                        message["chat"]["id"], uid, category, getattr(exc, "code", "access"), getattr(exc, "retry_after", 0))
+            try:
+                await self.send_group(message, e(explanation), kb([b("Открыть бота", url=f"https://t.me/{self.username}?start=v_{cid}_{kind}_{target}")]))
+            except TelegramError as feedback_error:
+                log.warning("Group error feedback failed: chat_id=%s code=%s", message["chat"]["id"], feedback_error.code)
+            if callback_id:
+                await self.tg.answer_callback(callback_id, explanation, True)
+            return False
+        panel = self.tg.row(uid)
+        log.info("Group private reply sent: chat_id=%s user_id=%s message_id=%s",
+                 message["chat"]["id"], uid, panel["message_id"] if panel else None)
+        if callback_id:
+            await self.tg.answer_callback(callback_id, "Отправлено новым сообщением в личку")
+        else:
+            try:
+                await self.send_group(message, "✅ Отправил ответ вам в личку.", kb([b("Открыть личку", url=f"https://t.me/{self.username}")]))
+            except TelegramError as exc:
+                log.warning("Group receipt failed after private delivery: chat_id=%s code=%s", message["chat"]["id"], exc.code)
+        return True
 
     async def group_check(self, message, classroom):
         chat_id, uid = message["chat"]["id"], message["from"]["id"]
-        lines = ["🔎 <b>Проверка группы · 0.2.1</b>", "✅ Эта команда получена ботом."]
+        lines = ["🔎 <b>Проверка группы · 0.2.3</b>", "✅ Эта команда получена ботом."]
         if classroom:
             lines.append(f"✅ Привязан класс: <b>{e(classroom['name'])}</b>.")
             member = self.db.one("SELECT m.active,u.started FROM members m JOIN users u ON u.id=m.user_id WHERE m.class_id=? AND m.user_id=?", (classroom["id"], uid))
@@ -282,8 +341,8 @@ class Application:
         except TelegramError as exc:
             log.warning("Group diagnostics failed: chat_id=%s code=%s", chat_id, exc.code)
             lines.append("⚠️ Не удалось проверить права бота. Назначьте его администратором и повторите команду.")
-        lines.append("\nПосле проверки отправьте /hw. Ответ откроется в личке, в сообщении с меню.")
-        await self.tg.send(chat_id, "\n".join(lines), kb([b("Открыть личку", url=f"https://t.me/{self.username}?start=group")]))
+        lines.append(f"\nПосле проверки отправьте /hw@{self.username}. Ответ придёт новым сообщением в личку.")
+        await self.send_group(message, "\n".join(lines), kb([b("Открыть личку", url=f"https://t.me/{self.username}?start=group")]))
 
     async def callback(self, query):
         uid = query["from"]["id"]
@@ -292,8 +351,10 @@ class Application:
         action = parts[0]
         message = query.get("message", {})
         private = message.get("chat", {}).get("type") == "private"
-        if not private and action not in ("v", "ack"):
+        if not private and action not in ("v", "ack", "g"):
             raise AccessDenied("Откройте этот раздел в личке с ботом.")
+        if action == "g":
+            return await self.group_interactive.callback(query, parts)
         if private and action in {"classes", "select", "help", "manage", "members", "member", "news", "reminders",
                                   "stats", "pairs", "bind", "scheduleedit", "audiences", "week", "v"}:
             self.db.clear_state(uid)
@@ -308,18 +369,13 @@ class Application:
         elif action == "v":
             cid, kind, target = int(parts[1]), parts[2], parts[3]
             if not private:
-                classroom = self.diary.require(cid, uid)
-                if classroom["group_id"] != message.get("chat", {}).get("id"):
+                classroom = self.db.one("SELECT group_id FROM classes WHERE id=?", (cid,))
+                if not classroom or classroom["group_id"] != message.get("chat", {}).get("id"):
                     raise AccessDenied("Это меню предназначено другой группе.")
-                try:
-                    await self.view(uid, cid, kind, target)
-                except TelegramError as exc:
-                    if exc.code not in (400, 403):
-                        raise
-                    await self.tg.send(message["chat"]["id"], "Для получения ответа сначала запустите бота в личке.",
-                                       kb([b("Открыть ответ", url=f"https://t.me/{self.username}?start=v_{cid}_{kind}_{target}")]))
-                    return await self.tg.answer_callback(query["id"], "Нажмите «Открыть ответ» под сообщением.", True)
-                return await self.tg.answer_callback(query["id"], "Отправлено вам в личку")
+                if kind in PUBLIC_VIEWS:
+                    await self.group_interactive.show(uid, cid, kind, message)
+                    return await self.tg.answer_callback(query["id"])
+                return await self.group_private_answer(message, uid, cid, kind, target, query["id"])
             await self.view(uid, cid, kind, target)
         elif action == "home":
             self.db.clear_state(uid)
@@ -854,6 +910,8 @@ class Application:
             return await self.week_view(uid, cid, target)
         if kind == "stats":
             return await self.stats(uid, cid)
+        if kind == "pairs":
+            return await self.pairs(uid, cid)
         if kind not in ("hw", "mine", "schedule"):
             raise ValueError("Неизвестный раздел.")
         day = parse_date(target, today_in(classroom["timezone"]))

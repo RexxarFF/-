@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -22,7 +23,11 @@ class Telegram:
         self._base = f"https://api.telegram.org/bot{token}/"
         self._context = ssl.create_default_context()
         self._send_lock = asyncio.Lock()
-        self._last_send = 0.0
+        self._last_send = float("-inf")
+        self._chat_locks = {}
+        self._chat_last = {}
+        self._clock = time.monotonic
+        self._sleep = asyncio.sleep
 
     def _request(self, method, payload):
         request = urllib.request.Request(self._base + method,
@@ -46,13 +51,37 @@ class Telegram:
 
     async def call(self, method, **payload):
         if method.startswith(("send", "edit", "copy")):
-            async with self._send_lock:
-                loop = asyncio.get_running_loop()
-                delay = 0.055 - (loop.time() - self._last_send)
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                self._last_send = loop.time()
+            chat_id = payload.get("chat_id")
+            if chat_id is not None:
+                lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+                async with lock:
+                    return await self._send_request(method, payload, chat_id)
+            return await self._send_request(method, payload)
         return await asyncio.to_thread(self._request, method, payload)
+
+    async def _send_request(self, method, payload, chat_id=None):
+        for attempt in range(2):
+            if chat_id is not None:
+                interval = 3.05 if isinstance(chat_id, int) and chat_id < 0 else 1.05
+                delay = self._chat_last.get(chat_id, float("-inf"))+interval-self._clock()
+                if delay > 0:
+                    await self._sleep(delay)
+            # Waiting for this chat does not hold the global lock or block another chat.
+            async with self._send_lock:
+                delay = self._last_send+0.055-self._clock()
+                if delay > 0:
+                    await self._sleep(delay)
+                self._last_send = self._clock()
+                if chat_id is not None:
+                    self._chat_last[chat_id] = self._last_send
+            try:
+                return await asyncio.to_thread(self._request, method, payload)
+            except TelegramError as exc:
+                # Retry only an explicit short rate limit. Network failures can mean a message
+                # was delivered without confirmation, so retrying them could create duplicates.
+                if exc.code != 429 or exc.retry_after > 5 or attempt:
+                    raise
+                await self._sleep(max(1, exc.retry_after))
 
     async def send(self, chat_id, text, keyboard=None, **extra):
         payload = dict(chat_id=chat_id, text=text, parse_mode="HTML",

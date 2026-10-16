@@ -20,6 +20,12 @@ class FakeTelegram:
         self.fail_delivery = False
         self.edit_error = None
         self.privacy_disabled = False
+        self.message_ids = {}
+        self.send_errors = {}
+
+    def next_message_id(self, chat_id):
+        self.message_ids[chat_id] = self.message_ids.get(chat_id, 0)+1
+        return self.message_ids[chat_id]
 
     def validate_text(self, text, keyboard):
         if len(text) > 4096:
@@ -30,13 +36,15 @@ class FakeTelegram:
             assert all(len(b.get("callback_data", "").encode()) <= 64 for b in buttons)
 
     async def send(self, chat_id, text, keyboard=None, **extra):
+        if chat_id in self.send_errors:
+            raise self.send_errors[chat_id]
         if chat_id in self.blocked:
             raise TelegramError(403, "Forbidden")
         if self.fail_delivery:
             raise TelegramError(429, "Retry later", 15)
         self.validate_text(text, keyboard)
         self.calls.append(("sendMessage", dict(chat_id=chat_id, text=text, reply_markup=keyboard, **extra)))
-        return {"message_id": len(self.calls), "chat": {"id": chat_id}}
+        return {"message_id": self.next_message_id(chat_id), "chat": {"id": chat_id}}
 
     async def answer_callback(self, callback_id, text="", alert=False):
         self.calls.append(("answerCallbackQuery", dict(callback_query_id=callback_id, text=text, show_alert=alert)))
@@ -51,7 +59,7 @@ class FakeTelegram:
                 raise self.edit_error
             return {"message_id": payload["message_id"]}
         if method in {"sendPhoto", "sendDocument", "sendVideo", "sendAudio", "sendVoice", "sendAnimation", "sendVideoNote"}:
-            return {"message_id": len(self.calls)}
+            return {"message_id": self.next_message_id(payload["chat_id"])}
         if method == "getChatMember":
             return {"status": "administrator" if payload["user_id"] in self.admins else "member"}
         if method == "getMe":
@@ -69,6 +77,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.app.username, self.app.bot_id = "class_diary_test_bot", 999
         self.datepatch = patch("classdiary.app.today_in", return_value=date(2026, 10, 14))
         self.datepatch.start()
+        self.groupdatepatch = patch("classdiary.group_interactive.today_in", return_value=date(2026, 10, 14))
+        self.groupdatepatch.start()
         for uid in (100, 101, 102, 200):
             self.app.diary.touch_user({"id": uid, "first_name": f"Ученик {uid}"}, started=True)
         self.cid = self.app.diary.create_class(100, "9Б", "Europe/Moscow")
@@ -79,12 +89,13 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.datepatch.stop()
+        self.groupdatepatch.stop()
         self.db.close()
 
-    async def callback(self, data, uid=100, group=False):
+    async def callback(self, data, uid=100, group=False, message_id=1):
         chat = {"id": -100 if group else uid, "type": "supergroup" if group else "private"}
         query = {"id": "callback-test", "from": {"id": uid, "first_name": f"Ученик {uid}"}, "data": data,
-                 "message": {"message_id": 1, "chat": chat}}
+                 "message": {"message_id": message_id, "chat": chat}}
         await self.app.on_update({"callback_query": query})
 
     async def message(self, text=None, uid=100, group=False, **extra):
@@ -328,7 +339,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         await self.callback(f"draft:{self.cid}:{state['nonce']}:save")
         aid = self.db.scalar("SELECT id FROM assignments")
         await self.callback(f"task:{self.cid}:{aid}")
-        photo_id = next(i+1 for i, (m, p) in enumerate(self.tg.calls) if m == "sendPhoto")
+        photo_id = json.loads(self.app.tg.row(100)["media_messages"])[0]
         await self.callback(f"v:{self.cid}:hw:2026-10-16")
         deletions = [p["message_id"] for m, p in self.tg.calls if m == "deleteMessage"]
         self.assertEqual(deletions, [photo_id])
@@ -400,19 +411,144 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("22.10.2026 · Четверг", self.texts())
         self.assertIn(f"week:{self.cid}:2026-10-22", str(self.tg.calls[-2]))
 
-    async def test_natural_group_request_sends_private_answer_only(self):
+    async def test_natural_group_request_sends_fresh_private_answer(self):
         self.app.diary.bind_group(self.cid, 100, -100, "9Б")
         await self.message("/start", uid=101)
         mid = self.app.tg.row(101)["message_id"]
         self.tg.calls.clear()
         await self.message("Что задано на завтра?", uid=101, group=True)
-        edits = [p for m, p in self.tg.calls if m == "editMessageText"]
-        self.assertEqual({(p["chat_id"], p["message_id"]) for p in edits}, {(101, mid)})
+        messages = [p for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == 101]
+        self.assertEqual(len(messages), 1, "A group request must create a visible new private reply")
+        self.assertNotEqual(self.app.tg.row(101)["message_id"], mid)
+        self.assertFalse(any(m == "editMessageText" for m, p in self.tg.calls))
         self.assertIn("Общее ДЗ", self.texts(101))
-        self.assertFalse(any(p.get("chat_id") == -100 for m, p in self.tg.calls if m.startswith("send")))
+        self.assertIn("Отправил ответ", self.texts(-100))
+        self.assertNotIn("Общее ДЗ", self.texts(-100))
         self.tg.calls.clear()
         await self.message("У меня завтра тренировка", uid=101, group=True)
         self.assertFalse(self.tg.calls)
+
+    async def test_group_button_creates_new_private_panel_then_back_edits_it(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/start", uid=101)
+        old = self.app.tg.row(101)["message_id"]
+        self.tg.calls.clear()
+        await self.callback(f"v:{self.cid}:hw:tomorrow", uid=101, group=True)
+        private_messages = [p for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == 101]
+        self.assertEqual(len(private_messages), 1)
+        fresh = self.app.tg.row(101)["message_id"]
+        self.assertNotEqual(old, fresh)
+        self.assertTrue(any(m == "deleteMessage" and p["chat_id"] == 101 and p["message_id"] == old for m, p in self.tg.calls))
+        self.tg.calls.clear()
+        await self.callback(f"home:{self.cid}", uid=101)
+        self.assertFalse(any(m == "sendMessage" for m, p in self.tg.calls))
+        self.assertEqual({p["message_id"] for m, p in self.tg.calls if m == "editMessageText"}, {fresh})
+
+    async def test_failed_private_delivery_keeps_previous_panel(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/start", uid=101)
+        old = self.app.tg.row(101)["message_id"]
+        self.tg.blocked.add(101)
+        self.tg.calls.clear()
+        await self.callback(f"v:{self.cid}:hw:tomorrow", uid=101, group=True)
+        self.assertEqual(self.app.tg.row(101)["message_id"], old)
+        self.assertFalse(any(m == "deleteMessage" for m, p in self.tg.calls))
+        self.assertIn("Не могу отправить ответ в личку", self.texts(-100))
+        self.assertTrue(any(m == "answerCallbackQuery" and p.get("show_alert") for m, p in self.tg.calls))
+
+    async def test_group_private_failure_explains_actual_error_category(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        for error, expected in ((TelegramError(429, "Rate limit", 30), "через 30 сек"),
+                                (TelegramError(0, "No network"), "не подтвердил доставку"),
+                                (TelegramError(400, "Can't parse entities"), "сформировать или отправить")):
+            with self.subTest(code=error.code):
+                self.tg.calls.clear()
+                self.tg.send_errors[101] = error
+                await self.message("/hw", uid=101, group=True)
+                self.assertIn(expected, self.texts(-100))
+                self.assertNotIn("нажмите /start", self.texts(-100))
+                self.assertNotIn("Отправил ответ", self.texts(-100))
+
+    async def test_my_command_in_group_delivers_only_requesters_private_notes(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        self.app.diary.save_assignment(self.cid, 101, dict(owner_id=101, source_key="note:mine", source_position=0,
+            assigned_on="2026-10-14", subject="Моё", audience_id=0, due_on="2026-10-15", due_position=0,
+            body="ЛИЧНЫЙ ТЕКСТ", attachments=[], no_homework=False, revision=0))
+        await self.message("/my@class_diary_test_bot", uid=101, group=True)
+        self.assertIn("ЛИЧНЫЙ ТЕКСТ", self.texts(101))
+        self.assertNotIn("ЛИЧНЫЙ ТЕКСТ", self.texts(-100))
+        self.assertFalse(any(p.get("chat_id") == 102 for m, p in self.tg.calls if m.startswith("send")))
+
+    async def test_unlisted_group_button_reports_access_error_without_private_delivery(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.callback(f"v:{self.cid}:hw:tomorrow", uid=200, group=True)
+        self.assertIn("Нет доступа к этому классу", self.texts(-100))
+        self.assertFalse(any(p.get("chat_id") == 200 for m, p in self.tg.calls if m.startswith("send")))
+        self.assertFalse(any("Отправлено новым" in p.get("text", "") for m, p in self.tg.calls if m == "answerCallbackQuery"))
+
+    async def test_group_receipt_failure_does_not_repeat_successful_private_delivery(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        self.tg.send_errors[-100] = TelegramError(429, "Rate", 30)
+        await self.message("/hw", uid=101, group=True)
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == 101]), 1)
+        self.assertIsNotNone(self.app.tg.row(101)["message_id"])
+
+    async def test_group_forum_reply_stays_in_source_topic_and_private_reply_has_no_group_thread(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/menu", group=True, message_thread_id=77, is_topic_message=True)
+        menu = next(p for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == -100)
+        self.assertEqual(menu["message_thread_id"], 77)
+        self.assertTrue(menu["reply_parameters"]["allow_sending_without_reply"])
+        self.tg.calls.clear()
+        await self.message("/hw", uid=101, group=True, message_thread_id=77, is_topic_message=True)
+        receipt = next(p for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == -100)
+        private = next(p for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == 101)
+        self.assertEqual(receipt["message_thread_id"], 77)
+        self.assertNotIn("message_thread_id", private)
+
+    async def test_long_group_answer_sends_one_private_message_then_pages_edit_it(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        state = await self.start_record()
+        await self.message("Очень длинное задание. "*260)
+        await self.callback(f"draft:{self.cid}:{state['nonce']}:save")
+        await self.message("/start", uid=101)
+        old = self.app.tg.row(101)["message_id"]
+        self.tg.calls.clear()
+        await self.callback(f"v:{self.cid}:hw:2026-10-16", uid=101, group=True)
+        panel = self.app.tg.row(101)["message_id"]
+        self.assertNotEqual(panel, old)
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == 101]), 1)
+        cache = self.app.tg.pages[101]
+        self.assertGreater(len(cache["pages"]), 1)
+        self.tg.calls.clear()
+        await self.callback(f"uipage:{cache['nonce']}:1", uid=101)
+        self.assertEqual({p["message_id"] for m, p in self.tg.calls if m == "editMessageText"}, {panel})
+        self.assertFalse(any(m == "sendMessage" for m, p in self.tg.calls))
+
+    async def test_old_panel_deletion_failure_does_not_hide_new_private_reply(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/start", uid=101)
+        old = self.app.tg.row(101)["message_id"]
+        original_call = self.tg.call
+
+        async def call(method, **payload):
+            if method == "deleteMessage":
+                raise TelegramError(400, "Message can't be deleted")
+            return await original_call(method, **payload)
+
+        self.tg.calls.clear()
+        with patch.object(self.tg, "call", side_effect=call):
+            await self.callback(f"v:{self.cid}:hw:tomorrow", uid=101, group=True)
+        self.assertNotEqual(self.app.tg.row(101)["message_id"], old)
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == 101]), 1)
+        self.assertTrue(any("Отправлено новым" in p.get("text", "") for m, p in self.tg.calls if m == "answerCallbackQuery"))
+
+    async def test_temporary_keyboard_cleanup_error_does_not_fail_successful_request(self):
+        with patch.object(self.app.tg, "close_keyboard", side_effect=TelegramError(429, "Rate", 30)):
+            await self.message("/start", uid=101)
+        self.assertIsNotNone(self.app.tg.row(101)["message_id"])
+        self.assertIn("Выберите действие", self.texts(101))
+        self.assertIsNone(self.app.tg.context.get())
 
     async def test_unlisted_group_request_does_not_expose_homework(self):
         self.app.diary.bind_group(self.cid, 100, -100, "9Б")
@@ -524,10 +660,144 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_command_accepts_newline_and_case_insensitive_bot_name(self):
         self.app.diary.bind_group(self.cid, 100, -100, "9Б")
         await self.message("/MENU@CLASS_DIARY_TEST_BOT\n", group=True)
-        self.assertIn("Ответ придёт вам в личку", self.texts(-100))
+        self.assertIn("ДЗ и расписание — в личку", self.texts(-100))
 
     async def test_group_logs_receipt_without_recording_homework_text(self):
         with self.assertLogs("classdiary.app", level="INFO") as capture:
             await self.message("Конфиденциальное сообщение", group=True)
         self.assertIn("Group message received: chat_id=-100", "\n".join(capture.output))
         self.assertNotIn("Конфиденциальное", "\n".join(capture.output))
+
+    async def test_statistics_and_interactive_commands_reply_in_group_even_if_private_chat_blocked(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        self.tg.blocked.add(101)
+        for command, title in (("/stats", "статистика"), ("/pairs", "Парные огоньки"),
+                               ("/interactive", "Парные огоньки"), ("моя статистика", "статистика"), ("огоньки", "Парные огоньки")):
+            with self.subTest(command=command):
+                self.tg.calls.clear()
+                await self.message(command, uid=101, group=True)
+                messages = [p for m, p in self.tg.calls if m == "sendMessage"]
+                self.assertTrue(messages)
+                self.assertTrue(all(p["chat_id"] == -100 for p in messages))
+                self.assertIn(title, self.texts(-100))
+                self.assertNotIn("Отправил ответ вам в личку", self.texts(-100))
+
+    async def test_group_menu_statistics_and_pair_buttons_send_no_private_messages(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        for kind in ("stats", "pairs"):
+            with self.subTest(kind=kind):
+                self.tg.calls.clear()
+                await self.callback(f"v:{self.cid}:{kind}:today", uid=101, group=True)
+                self.assertTrue(any(m == "sendMessage" and p["chat_id"] == -100 for m, p in self.tg.calls))
+                self.assertFalse(any(p.get("chat_id", -1) > 0 for m, p in self.tg.calls if m.startswith(("send", "edit", "delete"))))
+
+    async def test_group_interactive_keeps_private_draft_and_panel_untouched(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        self.app.tg.remember(101, message_id=111, media_messages="[112]", temporary_messages="[113]")
+        draft = {"cid": self.cid, "draft": {"body": "ЛИЧНЫЙ ЧЕРНОВИК"}}
+        self.db.set_state(101, "draft", draft)
+        before = self.app.tg.row(101)
+        await self.message("/stats", uid=101, group=True)
+        await self.callback(f"g:{self.cid}:101:p:0", uid=101, group=True)
+        self.assertEqual(self.app.tg.row(101), before)
+        self.assertEqual(self.db.state(101), ("draft", draft))
+        self.assertFalse(any(p.get("chat_id", -1) > 0 for m, p in self.tg.calls if m.startswith(("send", "edit", "delete"))))
+        self.assertNotIn("ЛИЧНЫЙ ЧЕРНОВИК", self.texts(-100))
+
+    async def test_group_interactive_refresh_edits_its_group_message(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/stats", uid=101, group=True)
+        self.tg.calls.clear()
+        await self.callback(f"g:{self.cid}:101:s", uid=101, group=True, message_id=45)
+        edits = [p for m, p in self.tg.calls if m == "editMessageText"]
+        self.assertEqual({(p["chat_id"], p["message_id"]) for p in edits}, {(-100, 45)})
+        self.assertFalse(any(m == "sendMessage" for m, p in self.tg.calls))
+        self.assertIn("Участник: <b>Ученик 101</b>", self.texts(-100))
+
+    async def test_group_interactive_buttons_cannot_be_used_by_another_actor(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.callback(f"g:{self.cid}:101:c:0", uid=102, group=True)
+        self.assertFalse(any(m in ("sendMessage", "editMessageText") for m, p in self.tg.calls))
+        self.assertTrue(any("другого участника" in p.get("text", "") for m, p in self.tg.calls if m == "answerCallbackQuery"))
+
+    async def test_pair_invitation_and_consent_happen_entirely_in_group(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/pairs", uid=101, group=True)
+        await self.callback(f"g:{self.cid}:101:c:0", uid=101, group=True)
+        self.tg.calls.clear()
+        await self.callback(f"g:{self.cid}:101:r:102", uid=101, group=True)
+        pair = self.db.one("SELECT * FROM pairs")
+        self.assertEqual(pair["accepted"], 0)
+        invitation = next(p for m, p in self.tg.calls if m == "sendMessage")
+        self.assertEqual(invitation["chat_id"], -100)
+        self.assertIn("tg://user?id=102", invitation["text"])
+        accept = f"g:{self.cid}:102:a:{pair['id']}:1"
+        self.assertIn(accept, str(invitation["reply_markup"]))
+        self.assertFalse(any(p.get("chat_id", -1) > 0 for m, p in self.tg.calls if m.startswith(("send", "edit"))))
+        await self.callback(accept, uid=100, group=True, message_id=2)
+        self.assertEqual(self.db.scalar("SELECT accepted FROM pairs"), 0)
+        self.tg.calls.clear()
+        await self.callback(accept, uid=102, group=True, message_id=2)
+        self.assertEqual(self.db.scalar("SELECT accepted FROM pairs"), 1)
+        self.assertTrue(any(m == "editMessageText" and p["chat_id"] == -100 and p["message_id"] == 2 for m, p in self.tg.calls))
+        self.assertFalse(any(p.get("chat_id", -1) > 0 for m, p in self.tg.calls if m.startswith(("send", "edit"))))
+
+    async def test_repeated_group_pair_request_does_not_duplicate_invitation(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.callback(f"g:{self.cid}:101:r:102", uid=101, group=True)
+        self.tg.calls.clear()
+        await self.callback(f"g:{self.cid}:101:r:102", uid=101, group=True)
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM pairs"), 1)
+        self.assertFalse(any(m == "sendMessage" for m, p in self.tg.calls))
+
+    async def test_group_pair_decline_and_remove_are_authorized(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        pid = self.app.diary.request_pair(self.cid, 101, 102)
+        await self.callback(f"g:{self.cid}:102:a:{pid}:0", uid=102, group=True)
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM pairs"), 0)
+        pid = self.app.diary.request_pair(self.cid, 101, 102)
+        self.app.diary.answer_pair(self.cid, 102, pid, True)
+        await self.callback(f"g:{self.cid}:100:x:{pid}", uid=100, group=True)
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM pairs"), 1)
+        await self.callback(f"g:{self.cid}:101:x:{pid}", uid=101, group=True)
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM pairs"), 0)
+
+    async def test_foreign_or_unlisted_group_interactive_requests_are_rejected(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        other = self.app.diary.create_class(200, "Другой класс", "UTC")
+        await self.callback(f"v:{other}:stats:today", uid=200, group=True)
+        await self.callback(f"g:{other}:200:s", uid=200, group=True)
+        await self.callback(f"v:{self.cid}:stats:today", uid=200, group=True)
+        self.assertFalse(any(m in ("sendMessage", "editMessageText") for m, p in self.tg.calls))
+
+    async def test_disabled_interactive_rejects_old_group_buttons_and_hides_menu_entries(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        self.db.run("UPDATE classes SET interactive=0 WHERE id=?", (self.cid,))
+        await self.message("/menu", group=True)
+        menu = next(p for m, p in self.tg.calls if m == "sendMessage")
+        self.assertNotIn(f"v:{self.cid}:stats", str(menu["reply_markup"]))
+        self.assertNotIn(f"v:{self.cid}:pairs", str(menu["reply_markup"]))
+        self.tg.calls.clear()
+        await self.callback(f"g:{self.cid}:101:r:102", uid=101, group=True)
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM pairs"), 0)
+        self.assertFalse(any(m in ("sendMessage", "editMessageText") for m, p in self.tg.calls))
+
+    async def test_pair_group_pages_remain_bounded_and_in_source_topic(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        for uid in range(300, 309):
+            self.app.diary.touch_user({"id": uid, "first_name": "&"*150}, started=True)
+            self.app.diary.add_members(self.cid, 100, [{"user_id": uid}])
+            self.app.diary.request_pair(self.cid, 101, uid)
+        await self.message("/pairs", uid=101, group=True, message_thread_id=77)
+        screen = next(p for m, p in self.tg.calls if m == "sendMessage")
+        self.assertEqual(screen["message_thread_id"], 77)
+        self.assertLessEqual(len(screen["text"]), 3800)
+        self.assertIn(f"g:{self.cid}:101:p:1", str(screen["reply_markup"]))
+        self.tg.calls.clear()
+        await self.callback(f"g:{self.cid}:101:p:1", uid=101, group=True)
+        self.assertTrue(any(m == "editMessageText" and p["chat_id"] == -100 for m, p in self.tg.calls))
+
+    async def test_interactive_control_data_fits_telegram_limit_for_large_ids(self):
+        from classdiary.group_interactive import GroupInteractive
+        data = GroupInteractive.data(2**63-1, 2**52-1, "a", 2**63-1, 1)
+        self.assertLessEqual(len(data.encode()), 64)

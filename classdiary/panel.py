@@ -15,6 +15,7 @@ from .ui import button, chunks
 class PanelContext:
     user_id: int
     adopt_message_id: int | None = None
+    fresh_message: bool = False
 
 
 class PanelTelegram:
@@ -47,8 +48,8 @@ class PanelTelegram:
                 raise ValueError("Invalid panel field")
             self.db.run(f"UPDATE ui_panels SET {key}=? WHERE user_id=?", (value, uid))
 
-    async def begin(self, uid, adopt_message_id=None):
-        token = self.context.set(PanelContext(uid, adopt_message_id))
+    async def begin(self, uid, adopt_message_id=None, fresh_message=False):
+        token = self.context.set(PanelContext(uid, adopt_message_id, fresh_message))
         # Only the bot's temporary file previews are removed. User messages and notifications are kept.
         row = self.row(uid)
         if row:
@@ -123,8 +124,9 @@ class PanelTelegram:
         row = self.row(uid)
         context = self.context.get()
         mid = row["message_id"] if row and row["message_id"] else (context.adopt_message_id if context else None)
+        fresh = bool(context and context.fresh_message)
         markup = keyboard if keyboard is not None else {"inline_keyboard": []}
-        if mid:
+        if mid and not fresh:
             try:
                 result = await self.transport.call("editMessageText", chat_id=uid, message_id=mid, text=text,
                                                    parse_mode="HTML", reply_markup=markup,
@@ -143,6 +145,14 @@ class PanelTelegram:
         result = await self.transport.send(uid, text, keyboard, **extra)
         if isinstance(result, dict) and result.get("message_id"):
             self.remember(uid, message_id=result["message_id"])
+            if context:
+                context.fresh_message = False
+            # Replace the old navigation panel only after the new reply was accepted by Telegram.
+            if fresh and mid and mid != result["message_id"]:
+                try:
+                    await self.transport.call("deleteMessage", chat_id=uid, message_id=mid)
+                except TelegramError:
+                    pass
         return result
 
     async def close_keyboard(self, uid):
