@@ -6,9 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
-import signal
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from classdiary.app import Application
@@ -31,13 +29,16 @@ def check():
 
 async def serve(config):
     log = logging.getLogger("classdiary")
+    log.info("Открываем SQLite и проверяем возможность записи...")
     db = Database(config.database)
     telegram = Telegram(config.token)
     app = Application(config, db, telegram)
     background = None
     try:
+        log.info("Подключаемся к Telegram: проверка токена (getMe)...")
         me = await telegram.call("getMe")
         app.username, app.bot_id = me["username"], me["id"]
+        log.info("Токен принят: @%s. Подготавливаем получение сообщений...", app.username)
         # Keep queued updates: homework messages sent while offline must not be discarded.
         await telegram.call("deleteWebhook", drop_pending_updates=False)
         await telegram.call("setMyCommands", commands=[
@@ -89,6 +90,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="Проверить проект без токена и сети")
     parser.add_argument("--backup", metavar="PATH", help="Сохранить резервную копию базы")
     args = parser.parse_args()
+    print(f"[ClassDiary 0.1.1] CLI started; Python {sys.version.split()[0]}", flush=True)
     if sys.version_info < (3, 11):
         print("Нужен Python 3.11 или новее.", file=sys.stderr)
         return 1
@@ -96,6 +98,8 @@ def main():
         if args.check:
             check()
             return 0
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        logging.getLogger("classdiary").info("Читаем BOT_TOKEN и настройки запуска...")
         config = Config.from_env()
         if args.backup:
             path = Path(args.backup).resolve()
@@ -108,12 +112,11 @@ def main():
                 db.close()
             print(f"Резервная копия: {path}")
             return 0
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         asyncio.run(serve(config))
     except KeyboardInterrupt:
         print("Бот остановлен.")
     except (ValueError, RuntimeError, TelegramError) as exc:
-        print(str(exc), file=sys.stderr)
+        print(str(exc), file=sys.stderr, flush=True)
         return 1
     return 0
 

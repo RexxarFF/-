@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+if __name__ == "__main__":
+    print("[ClassDiary 0.1.1] classdiary.app: starting", flush=True)
+
 import asyncio
 import json
 import logging

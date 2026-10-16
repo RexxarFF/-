@@ -5,4 +5,4 @@ RUN useradd --create-home --uid 10001 diary && mkdir -p /app/data && chown -R di
 USER diary
 ENV PYTHONUNBUFFERED=1
 VOLUME ["/app/data"]
-CMD ["python", "run.py"]
+CMD ["python", "-u", "main.py"]
