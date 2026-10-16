@@ -1,0 +1,9 @@
+services:
+  diary:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - diary_data:/app/data
+volumes:
+  diary_data:

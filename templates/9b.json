@@ -1,0 +1,443 @@
+{
+  "name": "9Б",
+  "timezone": "Europe/Moscow",
+  "source": "Фотография расписания от 16.10.2026",
+  "group_mapping_needs_review": true,
+  "notes": [
+    "Распределение подгрупп на фото не указано. Предварительно: первый предмет в ячейке через / — Группа 1, второй — Группа 2. Проверьте это в редакторе.",
+    "В английском по понедельникам созданы две подгруппы в одно время.",
+    "ВУД с несколькими вариантами внесены отдельными факультативными подгруппами.",
+    "Пустой первый урок в пятницу и субботу не добавлен. Нумерация строк и время сохранены."
+  ],
+  "week": {
+    "0": [
+      {
+        "position": 1,
+        "subject": "РОВ",
+        "audience": "",
+        "starts": "08:10",
+        "ends": "08:55",
+        "room": ""
+      },
+      {
+        "position": 2,
+        "subject": "Биология",
+        "audience": "",
+        "starts": "09:00",
+        "ends": "09:45",
+        "room": ""
+      },
+      {
+        "position": 3,
+        "subject": "Физика",
+        "audience": "",
+        "starts": "10:05",
+        "ends": "10:50",
+        "room": ""
+      },
+      {
+        "position": 4,
+        "subject": "Физкультура",
+        "audience": "",
+        "starts": "11:10",
+        "ends": "11:55",
+        "room": ""
+      },
+      {
+        "position": 5,
+        "subject": "Геометрия",
+        "audience": "",
+        "starts": "12:15",
+        "ends": "13:00",
+        "room": ""
+      },
+      {
+        "position": 6,
+        "subject": "Английский язык",
+        "audience": "Группа 1",
+        "starts": "13:20",
+        "ends": "14:05",
+        "room": ""
+      },
+      {
+        "position": 6,
+        "subject": "Английский язык",
+        "audience": "Группа 2",
+        "starts": "13:20",
+        "ends": "14:05",
+        "room": ""
+      },
+      {
+        "position": 7,
+        "subject": "Литература",
+        "audience": "",
+        "starts": "14:20",
+        "ends": "15:05",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ВУД по биологии",
+        "audience": "ВУД: биология",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ВУД по физике",
+        "audience": "ВУД: физика",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ВУД по английскому языку",
+        "audience": "ВУД: английский",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      }
+    ],
+    "1": [
+      {
+        "position": 1,
+        "subject": "ВУД по географии",
+        "audience": "",
+        "starts": "08:10",
+        "ends": "08:55",
+        "room": ""
+      },
+      {
+        "position": 2,
+        "subject": "Алгебра",
+        "audience": "",
+        "starts": "09:00",
+        "ends": "09:45",
+        "room": ""
+      },
+      {
+        "position": 3,
+        "subject": "Химия",
+        "audience": "",
+        "starts": "10:05",
+        "ends": "10:50",
+        "room": ""
+      },
+      {
+        "position": 4,
+        "subject": "Русский язык",
+        "audience": "",
+        "starts": "11:10",
+        "ends": "11:55",
+        "room": ""
+      },
+      {
+        "position": 5,
+        "subject": "Алгебра",
+        "audience": "",
+        "starts": "12:15",
+        "ends": "13:00",
+        "room": ""
+      },
+      {
+        "position": 6,
+        "subject": "География",
+        "audience": "",
+        "starts": "13:20",
+        "ends": "14:05",
+        "room": ""
+      },
+      {
+        "position": 7,
+        "subject": "Технология",
+        "audience": "Группа 1",
+        "starts": "14:20",
+        "ends": "15:05",
+        "room": ""
+      },
+      {
+        "position": 7,
+        "subject": "Английский язык",
+        "audience": "Группа 2",
+        "starts": "14:20",
+        "ends": "15:05",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ОБЗР",
+        "audience": "",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      }
+    ],
+    "2": [
+      {
+        "position": 1,
+        "subject": "ВУД по русскому языку",
+        "audience": "",
+        "starts": "08:10",
+        "ends": "08:55",
+        "room": ""
+      },
+      {
+        "position": 2,
+        "subject": "История",
+        "audience": "",
+        "starts": "09:00",
+        "ends": "09:45",
+        "room": ""
+      },
+      {
+        "position": 3,
+        "subject": "Биология",
+        "audience": "",
+        "starts": "10:05",
+        "ends": "10:50",
+        "room": ""
+      },
+      {
+        "position": 4,
+        "subject": "Английский язык",
+        "audience": "Группа 1",
+        "starts": "11:10",
+        "ends": "11:55",
+        "room": ""
+      },
+      {
+        "position": 4,
+        "subject": "Технология",
+        "audience": "Группа 2",
+        "starts": "11:10",
+        "ends": "11:55",
+        "room": ""
+      },
+      {
+        "position": 5,
+        "subject": "Физика",
+        "audience": "",
+        "starts": "12:15",
+        "ends": "13:00",
+        "room": ""
+      },
+      {
+        "position": 6,
+        "subject": "Литература",
+        "audience": "",
+        "starts": "13:20",
+        "ends": "14:05",
+        "room": ""
+      },
+      {
+        "position": 7,
+        "subject": "ВИС",
+        "audience": "",
+        "starts": "14:20",
+        "ends": "15:05",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ВУД по математике",
+        "audience": "",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      }
+    ],
+    "3": [
+      {
+        "position": 1,
+        "subject": "Профориентация",
+        "audience": "",
+        "starts": "08:10",
+        "ends": "08:55",
+        "room": ""
+      },
+      {
+        "position": 2,
+        "subject": "Русский язык",
+        "audience": "",
+        "starts": "09:00",
+        "ends": "09:45",
+        "room": ""
+      },
+      {
+        "position": 3,
+        "subject": "Физкультура",
+        "audience": "",
+        "starts": "10:05",
+        "ends": "10:50",
+        "room": ""
+      },
+      {
+        "position": 4,
+        "subject": "Химия",
+        "audience": "",
+        "starts": "11:10",
+        "ends": "11:55",
+        "room": ""
+      },
+      {
+        "position": 5,
+        "subject": "Геометрия",
+        "audience": "",
+        "starts": "12:15",
+        "ends": "13:00",
+        "room": ""
+      },
+      {
+        "position": 6,
+        "subject": "Геометрия",
+        "audience": "",
+        "starts": "13:20",
+        "ends": "14:05",
+        "room": ""
+      },
+      {
+        "position": 7,
+        "subject": "Литература",
+        "audience": "",
+        "starts": "14:20",
+        "ends": "15:05",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ВУД по химии",
+        "audience": "ВУД: химия",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ВУД по истории",
+        "audience": "ВУД: история",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      }
+    ],
+    "4": [
+      {
+        "position": 2,
+        "subject": "Физика",
+        "audience": "",
+        "starts": "09:00",
+        "ends": "09:45",
+        "room": ""
+      },
+      {
+        "position": 3,
+        "subject": "Английский язык",
+        "audience": "Группа 1",
+        "starts": "10:05",
+        "ends": "10:50",
+        "room": ""
+      },
+      {
+        "position": 3,
+        "subject": "Информатика",
+        "audience": "Группа 2",
+        "starts": "10:05",
+        "ends": "10:50",
+        "room": ""
+      },
+      {
+        "position": 4,
+        "subject": "Русский язык",
+        "audience": "",
+        "starts": "11:10",
+        "ends": "11:55",
+        "room": ""
+      },
+      {
+        "position": 5,
+        "subject": "История",
+        "audience": "",
+        "starts": "12:15",
+        "ends": "13:00",
+        "room": ""
+      },
+      {
+        "position": 6,
+        "subject": "Физика",
+        "audience": "",
+        "starts": "13:20",
+        "ends": "14:05",
+        "room": ""
+      },
+      {
+        "position": 7,
+        "subject": "Алгебра",
+        "audience": "",
+        "starts": "14:20",
+        "ends": "15:05",
+        "room": ""
+      },
+      {
+        "position": 8,
+        "subject": "ВУД по информатике",
+        "audience": "",
+        "starts": "15:15",
+        "ends": "16:00",
+        "room": ""
+      }
+    ],
+    "5": [
+      {
+        "position": 2,
+        "subject": "Информатика",
+        "audience": "Группа 1",
+        "starts": "09:00",
+        "ends": "09:45",
+        "room": ""
+      },
+      {
+        "position": 2,
+        "subject": "Английский язык",
+        "audience": "Группа 2",
+        "starts": "09:00",
+        "ends": "09:45",
+        "room": ""
+      },
+      {
+        "position": 3,
+        "subject": "География",
+        "audience": "",
+        "starts": "10:05",
+        "ends": "10:50",
+        "room": ""
+      },
+      {
+        "position": 4,
+        "subject": "Химия",
+        "audience": "",
+        "starts": "11:10",
+        "ends": "11:55",
+        "room": ""
+      },
+      {
+        "position": 5,
+        "subject": "Обществознание",
+        "audience": "",
+        "starts": "12:15",
+        "ends": "13:00",
+        "room": ""
+      },
+      {
+        "position": 6,
+        "subject": "Алгебра",
+        "audience": "",
+        "starts": "13:20",
+        "ends": "14:05",
+        "room": ""
+      }
+    ],
+    "6": []
+  }
+}
