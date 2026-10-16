@@ -2,6 +2,22 @@
 import re
 
 
+GROUP_COMMANDS = {"/start", "/menu", "/hw", "/tomorrow", "/schedule", "/stats", "/help", "/groupcheck"}
+
+
+def parse_command(text, username):
+    parts = text.strip().split(maxsplit=1)
+    command, payload = (parts[0], parts[1] if len(parts) > 1 else "") if parts else ("", "")
+    if command.startswith("/"):
+        command, separator, target = command.partition("@")
+        if separator and target.casefold() != username.casefold():
+            return None, ""
+        return command.casefold(), payload
+    if command.startswith("@") and command.rstrip(",!:")[1:].casefold() != username.casefold():
+        return None, ""
+    return command, payload
+
+
 def parse_group_request(text):
     text = text.casefold().replace("ё", "е").strip()
     text = re.sub(r"^@[a-z0-9_]+\s*[,!:]?\s*", "", text)

@@ -19,6 +19,7 @@ class FakeTelegram:
         self.admins = {100, 999}
         self.fail_delivery = False
         self.edit_error = None
+        self.privacy_disabled = False
 
     def validate_text(self, text, keyboard):
         if len(text) > 4096:
@@ -53,6 +54,8 @@ class FakeTelegram:
             return {"message_id": len(self.calls)}
         if method == "getChatMember":
             return {"status": "administrator" if payload["user_id"] in self.admins else "member"}
+        if method == "getMe":
+            return {"id": 999, "username": "class_diary_test_bot", "can_read_all_group_messages": self.privacy_disabled}
         if method == "getChat":
             return {"id": payload["chat_id"], "type": "supergroup", "title": "Класс"}
         return True
@@ -452,3 +455,79 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         screens = [p for m, p in self.tg.calls if m in ("sendMessage", "editMessageText")]
         self.assertIn("Класс создан", screens[-1]["text"])
         self.assertIn("Составить своё расписание", str(screens[-1]["reply_markup"]))
+
+    async def test_unbound_group_menu_explains_binding_instead_of_silence(self):
+        await self.message("/menu@class_diary_test_bot", group=True)
+        self.assertIn("Бот получил сообщение", self.texts(-100))
+        self.assertIn("Группа пока не привязана", self.texts(-100))
+        self.assertIsNone(self.db.scalar("SELECT group_id FROM classes WHERE id=?", (self.cid,)))
+
+    async def test_unbound_group_natural_request_gets_setup_hint(self):
+        await self.message("что задано на завтра", group=True)
+        self.assertIn("Привязать группу", self.texts(-100))
+        self.assertNotIn("Общее ДЗ", self.texts(-100))
+
+    async def test_unbound_group_chatter_is_ignored(self):
+        await self.message("Всем привет", group=True)
+        self.assertFalse(self.tg.calls)
+
+    async def test_anonymous_group_command_gets_identity_hint_without_class_access(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/hw@class_diary_test_bot", group=True,
+                           sender_chat={"id": -100, "type": "supergroup"},
+                           **{"from": {"id": 1087968824, "is_bot": True, "first_name": "Group"}})
+        self.assertIn("Переключитесь на свой личный аккаунт", self.texts(-100))
+        self.assertFalse(self.db.scalar("SELECT 1 FROM users WHERE id=1087968824"))
+        self.assertFalse(any(p.get("chat_id", 0) > 0 for m, p in self.tg.calls if m.startswith("send")))
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM message_events"), 0)
+
+    async def test_anonymous_foreign_bot_command_is_ignored(self):
+        await self.message("/hw@another_bot", group=True,
+                           sender_chat={"id": -100, "type": "supergroup"},
+                           **{"from": {"id": 1087968824, "is_bot": True}})
+        self.assertFalse(self.tg.calls)
+
+    async def test_real_bot_messages_are_ignored(self):
+        await self.message("/hw", group=True, **{"from": {"id": 1234, "is_bot": True}})
+        self.assertFalse(self.tg.calls)
+
+    async def test_groupcheck_reports_binding_membership_and_admin_status(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/groupcheck@class_diary_test_bot", uid=101, group=True)
+        text = self.texts(-100)
+        self.assertIn("Эта команда получена ботом", text)
+        self.assertIn("Привязан класс: <b>9Б</b>", text)
+        self.assertIn("Вы добавлены в класс", text)
+        self.assertIn("Статус бота: администратор", text)
+        self.assertIn("Privacy Mode: включён", text)
+
+    async def test_groupcheck_warns_when_privacy_blocks_normal_messages(self):
+        self.tg.admins.discard(999)
+        await self.message("/groupcheck@class_diary_test_bot", group=True)
+        text = self.texts(-100)
+        self.assertIn("Группа не привязана", text)
+        self.assertIn("Для обычных фраз назначьте бота администратором", text)
+        self.assertIn("Privacy Mode: включён", text)
+
+    async def test_groupcheck_disabled_privacy_explains_readding(self):
+        self.tg.admins.discard(999)
+        self.tg.privacy_disabled = True
+        await self.message("/groupcheck@class_diary_test_bot", group=True)
+        self.assertIn("Privacy Mode: выключен", self.texts(-100))
+        self.assertIn("удалите и снова добавьте", self.texts(-100))
+
+    async def test_group_request_with_bot_prefix_and_comma_is_handled(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("@class_diary_test_bot, что задано на завтра?", uid=101, group=True)
+        self.assertIn("Общее ДЗ", self.texts(101))
+
+    async def test_group_command_accepts_newline_and_case_insensitive_bot_name(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/MENU@CLASS_DIARY_TEST_BOT\n", group=True)
+        self.assertIn("Ответ придёт вам в личку", self.texts(-100))
+
+    async def test_group_logs_receipt_without_recording_homework_text(self):
+        with self.assertLogs("classdiary.app", level="INFO") as capture:
+            await self.message("Конфиденциальное сообщение", group=True)
+        self.assertIn("Group message received: chat_id=-100", "\n".join(capture.output))
+        self.assertNotIn("Конфиденциальное", "\n".join(capture.output))

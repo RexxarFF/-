@@ -1,6 +1,6 @@
 import unittest
 
-from classdiary.group_requests import parse_group_request
+from classdiary.group_requests import parse_command, parse_group_request
 
 
 class GroupRequestTests(unittest.TestCase):
@@ -20,3 +20,9 @@ class GroupRequestTests(unittest.TestCase):
         for text in ("Завтра сделаю дз", "Никто не знает, что задано на завтра? Я потом уточню", "Привет", "", "@all"):
             with self.subTest(text=text):
                 self.assertIsNone(parse_group_request(text))
+
+    def test_only_own_addressed_commands_are_accepted(self):
+        self.assertEqual(parse_command("/menu@Class_Bot", "class_bot"), ("/menu", ""))
+        self.assertEqual(parse_command("/start@class_bot\nbind_123", "class_bot"), ("/start", "bind_123"))
+        self.assertEqual(parse_command("/menu@other_bot", "class_bot"), (None, ""))
+        self.assertEqual(parse_command("@other_bot, что задано на завтра", "class_bot"), (None, ""))

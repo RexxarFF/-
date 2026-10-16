@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 if __name__ == "__main__":
-    print("[ClassDiary 0.2.0] classdiary.app: starting", flush=True)
+    print("[ClassDiary 0.2.1] classdiary.app: starting", flush=True)
 
 import asyncio
 import calendar
@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from .config import ROOT, Config, get_timezone, today_in
 from .db import Database
-from .group_requests import parse_group_request
+from .group_requests import GROUP_COMMANDS, parse_command, parse_group_request
 from .panel import PanelTelegram
 from .schedule import DAYS, SHORT_DAYS, parse_date, parse_day
 from .service import AccessDenied, Diary, PERMISSIONS
@@ -75,6 +75,22 @@ class Application:
                           "Общая домашка и ваши личные записи открываются отдельно.", {"inline_keyboard": rows})
 
     async def on_update(self, update):
+        message = update.get("message", {})
+        if message.get("chat", {}).get("type") in ("group", "supergroup"):
+            command, _ = parse_command(message.get("text", ""), self.username)
+            if command is None:
+                return
+            kind = command if command in GROUP_COMMANDS else "message"
+            log.info("Group message received: chat_id=%s kind=%s anonymous=%s", message["chat"]["id"], kind, bool(message.get("sender_chat")))
+            if message.get("sender_chat"):
+                if command in GROUP_COMMANDS or parse_group_request(message.get("text", "")):
+                    try:
+                        await self.tg.send(message["chat"]["id"], "Сообщение отправлено от имени группы или канала. "
+                                           "Переключитесь на свой личный аккаунт и повторите запрос: "
+                                           "так бот сможет проверить доступ к классу и ответить вам в личку.")
+                    except TelegramError as exc:
+                        log.warning("Group reply failed: chat_id=%s code=%s", message["chat"]["id"], exc.code)
+                return
         event = update.get("callback_query") or update.get("message") or {}
         user = event.get("from")
         if not user or user.get("is_bot"):
@@ -128,11 +144,9 @@ class Application:
         private = message["chat"]["type"] == "private"
         self.diary.touch_user(user, started=private)
         text = message.get("text", "").strip()
-        command, _, payload = text.partition(" ")
-        if "@" in command:
-            command, mention = command.split("@", 1)
-            if mention.casefold() != self.username.casefold():
-                return
+        command, payload = parse_command(text, self.username)
+        if command is None:
+            return
         if not private:
             return await self.group_message(message, command, payload)
         if command in ("/start", "/menu", "/cancel"):
@@ -150,6 +164,10 @@ class Application:
             return await self.home(uid)
         if command == "/help":
             return await self.help(uid)
+        if command == "/groupcheck":
+            return await self.tg.send(uid, "Для проверки отправьте "
+                                      f"<code>/groupcheck@{e(self.username)}</code> в нужную группу.\n"
+                                      "Привязка: «Управление классом → Привязать группу».", kb([b("В меню", "classes")]))
         if "users_shared" in message:
             return await self.shared_users(uid, message["users_shared"])
         if "chat_shared" in message:
@@ -177,6 +195,7 @@ class Application:
                            "🔥 Серия растёт за дни общения в привязанной группе.\n\n"
                            "/menu — меню; /cancel — отменить ввод; /hw — общее ДЗ; /my — личные записи; "
                            "/schedule — расписание недели; /stats — статистика.\n\n"
+                           "/groupcheck — проверка привязки и настроек доступа бота в группе.\n\n"
                            "В группе напишите «что задано на завтра» — ответ откроется в личке.\n"
                            f"Старые задания удаляются через {self.config.homework_retention_days} дней после записи, когда дата выполнения уже прошла.",
                            kb([b("В меню", "classes")]))
@@ -202,15 +221,26 @@ class Application:
             classroom = self.diary.require(target["id"], uid)
             await self.tg.send(chat_id, f"🏫 Группа привязана к классу <b>{e(classroom['name'])}</b>.\n"
                                "Для счётчика сообщений назначьте бота администратором или отключите Privacy Mode через @BotFather.")
-        if not classroom:
-            return
         shortcuts = {"/hw": "hw", "/tomorrow": "hw", "/schedule": "week", "/stats": "stats"}
         request = (shortcuts[command], "tomorrow") if command in shortcuts else parse_group_request(message.get("text", ""))
+        if command == "/groupcheck":
+            return await self.group_check(message, classroom)
+        if not classroom:
+            if command in GROUP_COMMANDS or request:
+                await self.tg.send(chat_id, "✅ Бот получил сообщение из этой группы.\n\n"
+                                   "Группа пока не привязана к классу. Владелец класса должен открыть бота в личке: "
+                                   "«Управление классом → Привязать группу → Выбрать существующую группу».",
+                                   kb([b("Открыть бота", url=f"https://t.me/{self.username}?start=group")]))
+            return
+        if command == "/help":
+            return await self.tg.send(chat_id, "Команды группы: /menu, /hw, /schedule, /stats, /groupcheck.\n"
+                                      "Также можно написать «что задано на завтра». Ответ с заданиями открывается в личке.")
         if request:
             kind, target = request
             try:
                 self.diary.require(classroom["id"], uid)
                 await self.view(uid, classroom["id"], kind, target)
+                log.info("Group request handled: chat_id=%s destination=private", chat_id)
             except (TelegramError, AccessDenied):
                 await self.tg.send(chat_id, "Откройте бота в личке. Доступ получают участники, которых добавил владелец класса.",
                                    kb([b("Открыть бота", url=f"https://t.me/{self.username}?start=v_{classroom['id']}_{kind}_{target}")]))
@@ -221,6 +251,39 @@ class Application:
                                   [b("📅 Расписание недели", f"v:{classroom['id']}:week:today")],
                                   [b("📊 Моя статистика", f"v:{classroom['id']}:stats:today")],
                                   [b("Открыть бота", url=f"https://t.me/{self.username}?start=c_{classroom['invite_token']}")]))
+
+    async def group_check(self, message, classroom):
+        chat_id, uid = message["chat"]["id"], message["from"]["id"]
+        lines = ["🔎 <b>Проверка группы · 0.2.1</b>", "✅ Эта команда получена ботом."]
+        if classroom:
+            lines.append(f"✅ Привязан класс: <b>{e(classroom['name'])}</b>.")
+            member = self.db.one("SELECT m.active,u.started FROM members m JOIN users u ON u.id=m.user_id WHERE m.class_id=? AND m.user_id=?", (classroom["id"], uid))
+            if member and member["active"] and member["started"]:
+                lines.append("✅ Вы добавлены в класс и запускали бота в личке.")
+            elif member:
+                lines.append("⚠️ Вы добавлены в класс. Нажмите «Начать» в личке бота.")
+            else:
+                lines.append("⚠️ Владелец класса должен добавить вас в список участников.")
+        else:
+            lines.append("⚠️ Группа не привязана. Откройте в личке: «Управление классом → Привязать группу».")
+        try:
+            me = await self.tg.call("getMe")
+            bot_member = await self.tg.call("getChatMember", chat_id=chat_id, user_id=me["id"])
+            admin = bot_member.get("status") in ("administrator", "creator")
+            privacy_disabled = bool(me.get("can_read_all_group_messages"))
+            lines.append("Статус бота: " + ("администратор." if admin else "участник."))
+            lines.append("Privacy Mode: " + ("выключен." if privacy_disabled else "включён."))
+            if admin:
+                lines.append("✅ Статус администратора даёт доступ к обычным сообщениям.")
+            elif privacy_disabled:
+                lines.append("Если Privacy Mode выключен недавно, удалите и снова добавьте бота в группу.")
+            else:
+                lines.append("⚠️ Для обычных фраз назначьте бота администратором либо отключите Privacy Mode у @BotFather и добавьте бота в группу заново.")
+        except TelegramError as exc:
+            log.warning("Group diagnostics failed: chat_id=%s code=%s", chat_id, exc.code)
+            lines.append("⚠️ Не удалось проверить права бота. Назначьте его администратором и повторите команду.")
+        lines.append("\nПосле проверки отправьте /hw. Ответ откроется в личке, в сообщении с меню.")
+        await self.tg.send(chat_id, "\n".join(lines), kb([b("Открыть личку", url=f"https://t.me/{self.username}?start=group")]))
 
     async def callback(self, query):
         uid = query["from"]["id"]
