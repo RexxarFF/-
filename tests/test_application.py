@@ -18,18 +18,22 @@ class FakeTelegram:
         self.blocked = set()
         self.admins = {100, 999}
         self.fail_delivery = False
+        self.edit_error = None
 
-    async def send(self, chat_id, text, keyboard=None, **extra):
-        if chat_id in self.blocked:
-            raise TelegramError(403, "Forbidden")
-        if self.fail_delivery:
-            raise TelegramError(429, "Retry later", 15)
+    def validate_text(self, text, keyboard):
         if len(text) > 4096:
             raise AssertionError(f"Oversized Telegram text: {len(text)}")
         if keyboard and "inline_keyboard" in keyboard:
             buttons = [b for row in keyboard["inline_keyboard"] for b in row]
             assert len(buttons) <= 100
             assert all(len(b.get("callback_data", "").encode()) <= 64 for b in buttons)
+
+    async def send(self, chat_id, text, keyboard=None, **extra):
+        if chat_id in self.blocked:
+            raise TelegramError(403, "Forbidden")
+        if self.fail_delivery:
+            raise TelegramError(429, "Retry later", 15)
+        self.validate_text(text, keyboard)
         self.calls.append(("sendMessage", dict(chat_id=chat_id, text=text, reply_markup=keyboard, **extra)))
         return {"message_id": len(self.calls), "chat": {"id": chat_id}}
 
@@ -38,6 +42,15 @@ class FakeTelegram:
 
     async def call(self, method, **payload):
         self.calls.append((method, payload))
+        if method == "editMessageText":
+            self.validate_text(payload["text"], payload.get("reply_markup"))
+            if payload["chat_id"] in self.blocked:
+                raise TelegramError(403, "Forbidden")
+            if self.edit_error:
+                raise self.edit_error
+            return {"message_id": payload["message_id"]}
+        if method in {"sendPhoto", "sendDocument", "sendVideo", "sendAudio", "sendVoice", "sendAnimation", "sendVideoNote"}:
+            return {"message_id": len(self.calls)}
         if method == "getChatMember":
             return {"status": "administrator" if payload["user_id"] in self.admins else "member"}
         if method == "getChat":
@@ -80,7 +93,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         await self.app.on_update({"message": msg})
 
     def texts(self, uid=None):
-        return "\n".join(payload["text"] for method, payload in self.tg.calls if method == "sendMessage" and (uid is None or payload["chat_id"] == uid))
+        return "\n".join(payload["text"] for method, payload in self.tg.calls if method in ("sendMessage", "editMessageText") and (uid is None or payload["chat_id"] == uid))
 
     async def start_record(self, uid=100, scope="hw", subject="Английский язык", audience="Группа 1"):
         await self.callback(f"record:{self.cid}:{scope}", uid)
@@ -266,3 +279,176 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         await self.message(f"/start bind_{token}", group=True)
         self.assertIsNone(self.db.scalar("SELECT group_id FROM classes WHERE id=?", (self.cid,)))
         self.assertIn("администратор", self.texts(-100))
+
+    async def test_navigation_edits_one_persistent_message(self):
+        await self.message("/start")
+        mid = self.app.tg.row(100)["message_id"]
+        await self.callback(f"v:{self.cid}:hw:tomorrow")
+        await self.callback(f"home:{self.cid}")
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "sendMessage"]), 1)
+        self.assertEqual({p["message_id"] for m, p in self.tg.calls if m == "editMessageText"}, {mid})
+        # Restarting the handler must continue editing the same saved panel.
+        self.app = Application(self.app.config, self.db, self.tg)
+        await self.message("/menu")
+        self.assertEqual(self.app.tg.row(100)["message_id"], mid)
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "sendMessage"]), 1)
+
+    async def test_deleted_panel_is_replaced_once(self):
+        await self.message("/start")
+        old = self.app.tg.row(100)["message_id"]
+        self.tg.edit_error = TelegramError(400, "Bad Request: message to edit not found")
+        await self.callback(f"home:{self.cid}")
+        replacement = self.app.tg.row(100)["message_id"]
+        self.assertNotEqual(old, replacement)
+        self.tg.edit_error = None
+        await self.callback(f"v:{self.cid}:hw:tomorrow")
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "sendMessage"]), 2)
+        self.assertEqual(self.app.tg.row(100)["message_id"], replacement)
+
+    async def test_unchanged_panel_and_parse_errors_do_not_create_new_messages(self):
+        await self.message("/start")
+        for error in ("Bad Request: message is not modified", "Bad Request: can't parse entities"):
+            self.tg.edit_error = TelegramError(400, error)
+            await self.callback(f"home:{self.cid}")
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "sendMessage"]), 1)
+
+    async def test_old_private_callback_adopts_its_message_on_upgrade(self):
+        await self.app.on_update({"callback_query": {"id": "upgrade", "from": {"id": 100},
+            "data": f"home:{self.cid}", "message": {"message_id": 543, "text": "Старое меню",
+                                                       "chat": {"id": 100, "type": "private"}}}})
+        self.assertEqual(self.app.tg.row(100)["message_id"], 543)
+        self.assertFalse(any(m == "sendMessage" for m, p in self.tg.calls))
+
+    async def test_media_preview_is_removed_on_back_without_deleting_user_upload(self):
+        state = await self.start_record()
+        await self.message(photo=[{"file_id": "photo"}])
+        await self.callback(f"draft:{self.cid}:{state['nonce']}:save")
+        aid = self.db.scalar("SELECT id FROM assignments")
+        await self.callback(f"task:{self.cid}:{aid}")
+        photo_id = next(i+1 for i, (m, p) in enumerate(self.tg.calls) if m == "sendPhoto")
+        await self.callback(f"v:{self.cid}:hw:2026-10-16")
+        deletions = [p["message_id"] for m, p in self.tg.calls if m == "deleteMessage"]
+        self.assertEqual(deletions, [photo_id])
+
+    async def test_long_view_pages_reuse_panel_and_recheck_access(self):
+        state = await self.start_record()
+        await self.message("Очень длинное задание. "*260)
+        await self.callback(f"draft:{self.cid}:{state['nonce']}:save")
+        await self.callback(f"v:{self.cid}:hw:2026-10-16", uid=101)
+        cache = self.app.tg.pages[101]
+        self.assertGreater(len(cache["pages"]), 1)
+        self.tg.calls.clear()
+        await self.callback(f"uipage:{cache['nonce']}:1", uid=101)
+        self.assertEqual(len([1 for m, p in self.tg.calls if m == "editMessageText"]), 1)
+        self.assertFalse(any(m == "sendMessage" for m, p in self.tg.calls))
+        self.tg.calls.clear()
+        await self.callback(f"uipage:{cache['nonce']}:0", uid=102)
+        self.assertFalse(any(m == "editMessageText" for m, p in self.tg.calls))
+        self.app.diary.remove_member(self.cid, 100, 101)
+        self.tg.calls.clear()
+        await self.callback(f"uipage:{cache['nonce']}:0", uid=101)
+        self.assertFalse(any(m == "editMessageText" for m, p in self.tg.calls))
+
+    async def test_calendar_selects_dates_across_year_boundary(self):
+        await self.callback(f"record:{self.cid}:hw")
+        nonce = self.db.state(100)[1]["nonce"]
+        await self.callback(f"recorddate:{self.cid}:{nonce}")
+        state = self.db.state(100)[1]
+        await self.callback(f"cal:{self.cid}:{state['nonce']}:month:2026-12-01")
+        self.assertIn("2027-01-01", str(self.tg.calls[-2]))
+        await self.callback(f"cal:{self.cid}:{state['nonce']}:month:2027-01-01")
+        await self.callback(f"cal:{self.cid}:{state['nonce']}:pick:2027-01-04")
+        stage, data = self.db.state(100)
+        self.assertEqual(stage, "record_pick")
+        self.assertEqual(data["assigned_on"], "2027-01-04")
+        self.assertIn("04.01.2027 · Понедельник", self.texts())
+
+    async def test_due_calendar_keeps_draft_and_rejects_date_before_assignment(self):
+        await self.start_record()
+        await self.message("Текст задания")
+        await self.message(document={"file_id": "doc"})
+        nonce = self.db.state(100)[1]["nonce"]
+        await self.callback(f"draft:{self.cid}:{nonce}:date")
+        state = self.db.state(100)[1]
+        await self.callback(f"cal:{self.cid}:{state['nonce']}:pick:2026-10-13")
+        self.assertEqual(self.db.state(100)[0], "date_picker")
+        await self.callback(f"cal:{self.cid}:{state['nonce']}:pick:2026-10-23")
+        stage, data = self.db.state(100)
+        self.assertEqual(stage, "draft")
+        self.assertEqual(data["draft"]["due_on"], "2026-10-23")
+        self.assertEqual(data["draft"]["body"], "Текст задания")
+        self.assertEqual(data["draft"]["attachments"][0]["file_id"], "doc")
+        self.assertEqual(data["draft"]["due_position"], 3)
+
+    async def test_date_calendar_back_returns_to_original_view_date(self):
+        await self.callback(f"askdate:{self.cid}:hw:2026-11-03")
+        nonce = self.db.state(100)[1]["nonce"]
+        await self.callback(f"cal:{self.cid}:{nonce}:back")
+        self.assertIn("03.11.2026", self.texts())
+        self.assertIsNone(self.db.state(100)[0])
+
+    async def test_week_view_and_day_details_use_selected_week(self):
+        await self.callback(f"week:{self.cid}:today")
+        self.assertIn("12.10–18.10.2026", self.texts())
+        self.assertIn("Воскресенье · 18.10", self.texts())
+        await self.callback(f"week:{self.cid}:2026-10-19")
+        self.assertIn("19.10–25.10.2026", self.texts())
+        await self.callback(f"v:{self.cid}:schedule:2026-10-22")
+        self.assertIn("22.10.2026 · Четверг", self.texts())
+        self.assertIn(f"week:{self.cid}:2026-10-22", str(self.tg.calls[-2]))
+
+    async def test_natural_group_request_sends_private_answer_only(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("/start", uid=101)
+        mid = self.app.tg.row(101)["message_id"]
+        self.tg.calls.clear()
+        await self.message("Что задано на завтра?", uid=101, group=True)
+        edits = [p for m, p in self.tg.calls if m == "editMessageText"]
+        self.assertEqual({(p["chat_id"], p["message_id"]) for p in edits}, {(101, mid)})
+        self.assertIn("Общее ДЗ", self.texts(101))
+        self.assertFalse(any(p.get("chat_id") == -100 for m, p in self.tg.calls if m.startswith("send")))
+        self.tg.calls.clear()
+        await self.message("У меня завтра тренировка", uid=101, group=True)
+        self.assertFalse(self.tg.calls)
+
+    async def test_unlisted_group_request_does_not_expose_homework(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.message("Что задано на завтра?", uid=200, group=True)
+        self.assertNotIn("Общее ДЗ", self.texts(200))
+        self.assertIn("Открыть бота", str(self.tg.calls))
+
+    async def test_announcement_posts_immediately_with_class_mentions_once(self):
+        self.app.diary.bind_group(self.cid, 100, -100, "9Б")
+        await self.callback(f"announcement:{self.cid}")
+        await self.message("Завтра собрание")
+        self.db.run("UPDATE users SET name=? WHERE id=101", ("Ира <&>",))
+        state = self.db.state(100)[1]
+        self.tg.calls.clear()
+        await self.callback(f"annpublish:{self.cid}:{state['nonce']}")
+        group = [p for m, p in self.tg.calls if m == "sendMessage" and p["chat_id"] == -100]
+        self.assertEqual(len(group), 1)
+        self.assertIn("Завтра собрание", group[0]["text"])
+        self.assertIn('tg://user?id=101">Ира &lt;&amp;&gt;</a>', group[0]["text"])
+        self.assertIn("tg://user?id=102", group[0]["text"])
+        self.assertNotIn("tg://user?id=200", group[0]["text"])
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM deliveries WHERE state='pending'"), 3)
+        panel = self.app.tg.row(100)["message_id"]
+        self.tg.calls.clear()
+        await self.app.deliver_pending()
+        self.assertFalse(any(m == "editMessageText" for m, p in self.tg.calls))
+        self.assertFalse(any(p.get("chat_id") == -100 for m, p in self.tg.calls if m.startswith("send")))
+        self.assertEqual(self.app.tg.row(100)["message_id"], panel)
+
+    async def test_back_from_input_cancels_it_without_appending_later_text(self):
+        await self.start_record()
+        await self.callback(f"manage:{self.cid}")
+        self.assertIsNone(self.db.state(100)[0])
+        await self.message("Случайный текст")
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM assignments"), 0)
+
+    async def test_class_creation_preserves_setup_buttons_in_panel(self):
+        await self.callback("create")
+        await self.message("10А")
+        screens = [p for m, p in self.tg.calls if m in ("sendMessage", "editMessageText")]
+        self.assertIn("Класс создан", screens[-1]["text"])
+        self.assertIn("Составить своё расписание", str(screens[-1]["reply_markup"]))

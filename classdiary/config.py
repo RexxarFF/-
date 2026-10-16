@@ -55,6 +55,7 @@ class Config:
     database: Path
     default_timezone: str = "Europe/Moscow"
     max_classes_per_owner: int = 10
+    homework_retention_days: int = 14
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -70,4 +71,7 @@ class Config:
         maximum = int(os.environ.get("MAX_CLASSES_PER_OWNER", "10"))
         if maximum < 1:
             raise ValueError("MAX_CLASSES_PER_OWNER должен быть положительным.")
-        return cls(token, db, zone, maximum)
+        retention = int(os.environ.get("HOMEWORK_RETENTION_DAYS", "14"))
+        if not 1 <= retention <= 365:
+            raise ValueError("HOMEWORK_RETENTION_DAYS должен быть от 1 до 365.")
+        return cls(token, db, zone, maximum, retention)

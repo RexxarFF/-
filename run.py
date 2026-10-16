@@ -43,7 +43,7 @@ async def serve(config):
         await telegram.call("deleteWebhook", drop_pending_updates=False)
         await telegram.call("setMyCommands", commands=[
             {"command": "menu", "description": "Главное меню"}, {"command": "hw", "description": "Общее ДЗ на завтра"},
-            {"command": "my", "description": "Личные записи на завтра"}, {"command": "schedule", "description": "Расписание на завтра"},
+            {"command": "my", "description": "Личные записи на завтра"}, {"command": "schedule", "description": "Расписание недели"},
             {"command": "stats", "description": "Статистика сообщений"}, {"command": "cancel", "description": "Отменить ввод"},
             {"command": "help", "description": "Как пользоваться"}])
         log.info("Started @%s. Polling. Press Ctrl+C to stop.", app.username)
@@ -90,7 +90,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="Проверить проект без токена и сети")
     parser.add_argument("--backup", metavar="PATH", help="Сохранить резервную копию базы")
     args = parser.parse_args()
-    print(f"[ClassDiary 0.1.1] CLI started; Python {sys.version.split()[0]}", flush=True)
+    print(f"[ClassDiary 0.2.0] CLI started; Python {sys.version.split()[0]}", flush=True)
     if sys.version_info < (3, 11):
         print("Нужен Python 3.11 или новее.", file=sys.stderr)
         return 1

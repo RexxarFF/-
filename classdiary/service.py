@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from .config import get_timezone
 from .db import Database
@@ -283,7 +283,7 @@ class Diary:
                 result = old["id"]
             else:
                 result = self.db.run("INSERT INTO assignments(subject,audience_id,due_on,due_position,body,attachments,no_homework,editor_id,"
-                                     "class_id,owner_id,source_key,assigned_on,source_position) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                     "class_id,owner_id,source_key,assigned_on,source_position,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
                                      values + key + (int(draft.get("source_position", 0)),)).lastrowid
             self.db.run("DELETE FROM completions WHERE assignment_id=?", (result,))
             # Audit contains identifiers only, never private homework text.
@@ -346,7 +346,7 @@ class Diary:
                                (class_id, body, json.dumps(attachments, ensure_ascii=False), actor)).lastrowid
             recipients = [m["id"] for m in self.members(class_id, actor) if m["active"]]
             if classroom["group_id"]:
-                recipients.append(classroom["group_id"])
+                recipients.insert(0, classroom["group_id"])
             for recipient in recipients:
                 self.queue(f"ann:{aid}:{recipient}", class_id, recipient, "announcement", {"id": aid})
             self.db.audit(class_id, actor, "announcement.publish", str(aid))
@@ -361,6 +361,25 @@ class Diary:
     def queue(self, key, class_id, recipient, kind, payload):
         self.db.run("INSERT OR IGNORE INTO deliveries(unique_key,class_id,recipient,kind,payload) VALUES(?,?,?,?,?)",
                     (key, class_id, recipient, kind, json.dumps(payload)))
+
+    def purge_old_homework(self, retention_days=14, now=None):
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if retention_days < 1:
+            raise ValueError("Срок хранения должен быть положительным.")
+        cutoff = (now.astimezone(timezone.utc)-timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+        deleted = 0
+        with self.db.transaction():
+            for classroom in self.db.all("SELECT id,timezone FROM classes"):
+                today = now.astimezone(get_timezone(classroom["timezone"])).date().isoformat()
+                count = self.db.run("DELETE FROM assignments WHERE class_id=? AND created_at<=? AND due_on<?",
+                                    (classroom["id"], cutoff, today)).rowcount
+                deleted += count
+                if count:
+                    self.db.audit(classroom["id"], 0, "assignment.cleanup", str(count))
+            self.db.run("DELETE FROM fsm WHERE updated_at<=datetime('now','-1 day')")
+        return deleted
 
     def count_message(self, chat_id, message_id, user_id, day: date):
         classroom = self.db.one("SELECT * FROM classes WHERE group_id=? AND interactive=1", (chat_id,))

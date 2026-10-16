@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS assignments (
  due_on TEXT NOT NULL, due_position INTEGER NOT NULL DEFAULT 0, body TEXT NOT NULL,
  attachments TEXT NOT NULL DEFAULT '[]', no_homework INTEGER NOT NULL DEFAULT 0,
  revision INTEGER NOT NULL DEFAULT 1, editor_id INTEGER NOT NULL,
- updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  UNIQUE(class_id,owner_id,source_key,assigned_on)
 );
 CREATE INDEX IF NOT EXISTS assignment_due ON assignments(class_id,owner_id,due_on);
@@ -94,6 +94,10 @@ CREATE TABLE IF NOT EXISTS fsm (
  user_id INTEGER PRIMARY KEY, stage TEXT NOT NULL, data TEXT NOT NULL,
  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS ui_panels (
+ user_id INTEGER PRIMARY KEY REFERENCES users(id), message_id INTEGER,
+ media_messages TEXT NOT NULL DEFAULT '[]', temporary_messages TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE IF NOT EXISTS audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, class_id INTEGER NOT NULL, actor INTEGER NOT NULL,
  action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -114,6 +118,11 @@ class Database:
         self.conn.execute("PRAGMA busy_timeout=10000")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(assignments)")}
+        if "created_at" not in columns:
+            self.conn.execute("ALTER TABLE assignments ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+            self.conn.execute("UPDATE assignments SET created_at=updated_at WHERE created_at=''")
+        self.conn.execute("UPDATE deliveries SET state='pending' WHERE state='sending'")
         version = self.scalar("SELECT value FROM meta WHERE key='schema_version'")
         if version is not None and version != "1":
             raise RuntimeError("Версия базы не поддерживается этим выпуском. Сделайте резервную копию.")

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 if __name__ == "__main__":
-    print("[ClassDiary 0.1.1] classdiary.app: starting", flush=True)
+    print("[ClassDiary 0.2.0] classdiary.app: starting", flush=True)
 
 import asyncio
+import calendar
 import json
 import logging
 import secrets
@@ -13,17 +14,20 @@ from datetime import date, datetime, timedelta, timezone
 
 from .config import ROOT, Config, get_timezone, today_in
 from .db import Database
+from .group_requests import parse_group_request
+from .panel import PanelTelegram
 from .schedule import DAYS, SHORT_DAYS, parse_date, parse_day
-from .service import AccessDenied, Conflict, Diary, PERMISSIONS
+from .service import AccessDenied, Diary, PERMISSIONS
 from .telegram import Telegram, TelegramError
-from .ui import button as b, chunks, date_label, e, homework_text, keyboard as kb, lesson_label, text_lines, timetable_text
+from .ui import button as b, date_label, e, homework_text, keyboard as kb, lesson_label, text_lines, timetable_text
 
 log = logging.getLogger(__name__)
 
 
 class Application:
     def __init__(self, config: Config, db: Database, telegram: Telegram):
-        self.config, self.db, self.tg = config, db, telegram
+        self.config, self.db = config, db
+        self.tg = PanelTelegram(telegram, db)
         self.diary = Diary(db)
         self.username = ""
         self.bot_id = 0
@@ -40,11 +44,7 @@ class Application:
         return stage, data
 
     async def send_long(self, uid, text, keyboard=None):
-        parts = list(chunks(text)) or ["Нет данных."]
-        result = None
-        for index, part in enumerate(parts):
-            result = await self.tg.send(uid, part, keyboard if index == len(parts)-1 else None)
-        return result
+        return await self.tg.send_long(uid, text, keyboard)
 
     async def home(self, uid, cid=None):
         user = self.db.one("SELECT * FROM users WHERE id=?", (uid,))
@@ -62,7 +62,7 @@ class Application:
         rights = self.diary.permissions(cid, uid)
         rows = [[b("📚 Общее ДЗ на завтра", f"v:{cid}:hw:tomorrow")],
                 [b("📝 Мои записи", f"v:{cid}:mine:tomorrow"), b("➕ Записать себе", f"record:{cid}:mine")],
-                [b("📅 Расписание на завтра", f"v:{cid}:schedule:tomorrow")],
+                [b("📅 Расписание на завтра", f"v:{cid}:schedule:tomorrow"), b("Вся неделя", f"week:{cid}:today")],
                 [b("📢 Объявления", f"news:{cid}"), b("👥 Мои подгруппы", f"audiences:{cid}")]]
         if "homework" in rights:
             rows.append([b("✏️ Записать общее ДЗ", f"record:{cid}:hw")])
@@ -75,6 +75,25 @@ class Application:
                           "Общая домашка и ваши личные записи открываются отдельно.", {"inline_keyboard": rows})
 
     async def on_update(self, update):
+        event = update.get("callback_query") or update.get("message") or {}
+        user = event.get("from")
+        if not user or user.get("is_bot"):
+            return
+        query = update.get("callback_query", {})
+        origin = query.get("message", {})
+        adopt = origin.get("message_id") if origin.get("chat", {}).get("type") == "private" and origin.get("text") and not query.get("data", "").startswith("ack:") else None
+        token = await self.tg.begin(int(user["id"]), adopt)
+        try:
+            await self.handle_update(update)
+        finally:
+            try:
+                stage, _ = self.db.state(int(user["id"]))
+                if stage not in ("pick_members", "pick_group"):
+                    await self.tg.close_keyboard(int(user["id"]))
+            finally:
+                self.tg.end(token)
+
+    async def handle_update(self, update):
         try:
             if "callback_query" in update:
                 await self.callback(update["callback_query"])
@@ -89,7 +108,7 @@ class Application:
             if callback:
                 await self.tg.answer_callback(callback["id"], message, True)
             elif update.get("message", {}).get("chat", {}).get("type") == "private":
-                await self.tg.send(update["message"]["chat"]["id"], e(message))
+                await self.tg.send(update["message"]["chat"]["id"], e(message), kb([b("В меню", "classes")]))
             elif update.get("message", {}).get("text", "").startswith("/"):
                 await self.tg.send(update["message"]["chat"]["id"], e(message))
         except TelegramError as exc:
@@ -118,7 +137,6 @@ class Application:
             return await self.group_message(message, command, payload)
         if command in ("/start", "/menu", "/cancel"):
             self.db.clear_state(uid)
-            await self.tg.send(uid, "Меню открыто.", {"remove_keyboard": True})
             if command == "/start" and payload.startswith("c_"):
                 classroom = self.db.one("SELECT * FROM classes WHERE invite_token=?", (payload[2:],))
                 if not classroom:
@@ -126,7 +144,7 @@ class Application:
                 self.diary.select_class(uid, classroom["id"])
             elif command == "/start" and payload.startswith("v_"):
                 parts = payload.split("_")
-                if len(parts) != 4 or parts[2] not in ("hw", "mine", "schedule", "stats"):
+                if len(parts) != 4 or parts[2] not in ("hw", "mine", "schedule", "week", "stats"):
                     raise ValueError("Неверная ссылка.")
                 return await self.view(uid, int(parts[1]), parts[2], parts[3])
             return await self.home(uid)
@@ -136,7 +154,7 @@ class Application:
             return await self.shared_users(uid, message["users_shared"])
         if "chat_shared" in message:
             return await self.shared_chat(uid, message["chat_shared"])
-        shortcuts = {"/hw": "hw", "/tomorrow": "hw", "/schedule": "schedule", "/my": "mine", "/stats": "stats"}
+        shortcuts = {"/hw": "hw", "/tomorrow": "hw", "/schedule": "week", "/my": "mine", "/stats": "stats"}
         if command in shortcuts:
             userrow = self.db.one("SELECT active_class FROM users WHERE id=?", (uid,))
             if not userrow or not userrow["active_class"]:
@@ -153,13 +171,15 @@ class Application:
                            "📝 Мои записи — только ваши задания и заметки.\n"
                            "✏️ При записи бот открывает предметы сегодняшнего дня и предлагает следующий день с этим предметом.\n"
                            "Каждый урок и каждая подгруппа записываются отдельно.\n"
-                           "📅 Расписание — уроки на выбранную дату с учётом замен.\n"
+                           "📅 Расписание — вся неделя и отдельные дни с учётом замен.\n"
                            "👥 В подгруппах можно выбрать свои занятия. Пока ничего не выбрано, видны все варианты.\n"
                            "📎 Откройте задание, чтобы получить фото и файлы.\n"
                            "🔥 Серия растёт за дни общения в привязанной группе.\n\n"
                            "/menu — меню; /cancel — отменить ввод; /hw — общее ДЗ; /my — личные записи; "
-                           "/schedule — расписание; /stats — статистика.\n\n"
-                           "Бот не отправляет домашку в группу автоматически. Важные объявления публикуются отдельно.")
+                           "/schedule — расписание недели; /stats — статистика.\n\n"
+                           "В группе напишите «что задано на завтра» — ответ откроется в личке.\n"
+                           f"Старые задания удаляются через {self.config.homework_retention_days} дней после записи, когда дата выполнения уже прошла.",
+                           kb([b("В меню", "classes")]))
 
     async def group_message(self, message, command, payload):
         chat_id, uid = message["chat"]["id"], message["from"]["id"]
@@ -184,19 +204,21 @@ class Application:
                                "Для счётчика сообщений назначьте бота администратором или отключите Privacy Mode через @BotFather.")
         if not classroom:
             return
-        shortcuts = {"/hw": "hw", "/tomorrow": "hw", "/schedule": "schedule", "/stats": "stats"}
-        if command in shortcuts:
+        shortcuts = {"/hw": "hw", "/tomorrow": "hw", "/schedule": "week", "/stats": "stats"}
+        request = (shortcuts[command], "tomorrow") if command in shortcuts else parse_group_request(message.get("text", ""))
+        if request:
+            kind, target = request
             try:
                 self.diary.require(classroom["id"], uid)
-                await self.view(uid, classroom["id"], shortcuts[command], "tomorrow")
+                await self.view(uid, classroom["id"], kind, target)
             except (TelegramError, AccessDenied):
                 await self.tg.send(chat_id, "Откройте бота в личке. Доступ получают участники, которых добавил владелец класса.",
-                                   kb([b("Открыть бота", url=f"https://t.me/{self.username}?start=v_{classroom['id']}_{shortcuts[command]}_tomorrow")]))
+                                   kb([b("Открыть бота", url=f"https://t.me/{self.username}?start=v_{classroom['id']}_{kind}_{target}")]))
             return
         if command in ("/menu", "/start"):
             await self.tg.send(chat_id, f"🏫 <b>{e(classroom['name'])}</b>\nОтвет придёт вам в личку.",
                                kb([b("📚 Общее ДЗ на завтра", f"v:{classroom['id']}:hw:tomorrow")],
-                                  [b("📅 Расписание на завтра", f"v:{classroom['id']}:schedule:tomorrow")],
+                                  [b("📅 Расписание недели", f"v:{classroom['id']}:week:today")],
                                   [b("📊 Моя статистика", f"v:{classroom['id']}:stats:today")],
                                   [b("Открыть бота", url=f"https://t.me/{self.username}?start=c_{classroom['invite_token']}")]))
 
@@ -209,7 +231,18 @@ class Application:
         private = message.get("chat", {}).get("type") == "private"
         if not private and action not in ("v", "ack"):
             raise AccessDenied("Откройте этот раздел в личке с ботом.")
-        if action == "v":
+        if private and action in {"classes", "select", "help", "manage", "members", "member", "news", "reminders",
+                                  "stats", "pairs", "bind", "scheduleedit", "audiences", "week", "v"}:
+            self.db.clear_state(uid)
+        if action == "noop":
+            return await self.tg.answer_callback(query["id"])
+        if action == "uipage":
+            await self.tg.show_page(uid, parts[1], int(parts[2]))
+        elif action == "week":
+            await self.week_view(uid, int(parts[1]), parts[2])
+        elif action == "cal":
+            await self.calendar_action(uid, int(parts[1]), parts[2], parts[3], parts[4] if len(parts) > 4 else "")
+        elif action == "v":
             cid, kind, target = int(parts[1]), parts[2], parts[3]
             if not private:
                 classroom = self.diary.require(cid, uid)
@@ -232,7 +265,7 @@ class Application:
             await self.help(uid)
         elif action == "create":
             self.new_state(uid, "class_name")
-            await self.tg.send(uid, "Введите название класса, например «9Б».\nОтменить: /cancel")
+            await self.tg.send(uid, "Введите название класса, например «9Б».", kb([b("Назад", "classes")]))
         elif action == "classes":
             rows = [[b(f"{c['name']} · #{c['id']}", f"select:{c['id']}")] for c in self.diary.classrooms(uid)]
             rows.append([b("➕ Создать класс", "create")])
@@ -247,8 +280,12 @@ class Application:
         elif action == "recorddate":
             cid = int(parts[1])
             _, data = self.need_state(uid, cid, parts[2], "record_pick")
-            self.db.set_state(uid, "record_date", data)
-            await self.tg.send(uid, "За какой день записываем? Введите дату ДД.ММ.ГГГГ. Это день, когда задание <b>задали</b>.")
+            await self.open_calendar(uid, cid, "record", date.fromisoformat(data["assigned_on"]), scope=data["scope"])
+        elif action == "recordagain":
+            cid = int(parts[1])
+            _, data = self.need_state(uid, cid, parts[2], "draft")
+            draft = data["draft"]
+            await self.record(uid, cid, "hw" if draft["owner_id"] == 0 else "mine", date.fromisoformat(draft["assigned_on"]))
         elif action == "lesson":
             cid, nonce, index = int(parts[1]), parts[2], int(parts[3])
             _, data = self.need_state(uid, cid, nonce, "record_pick")
@@ -262,7 +299,7 @@ class Application:
             if data["scope"] != "mine":
                 raise ValueError("Общее задание привязывается к уроку расписания.")
             self.db.set_state(uid, "custom_title", data)
-            await self.tg.send(uid, "Введите предмет или название личной заметки.")
+            await self.tg.send(uid, "Введите предмет или название личной заметки.", kb([b("Назад", f"record:{cid}:mine")]))
         elif action == "draft":
             await self.draft_action(uid, int(parts[1]), parts[2], parts[3])
         elif action == "askdate":
@@ -270,8 +307,9 @@ class Application:
             self.diary.require(cid, uid)
             if kind not in ("hw", "mine", "schedule"):
                 raise ValueError("Неизвестный раздел.")
-            self.new_state(uid, "view_date", cid, kind=kind)
-            await self.tg.send(uid, "Введите дату просмотра: ДД.ММ.ГГГГ.")
+            classroom = self.diary.require(cid, uid)
+            base = parse_date(parts[3], today_in(classroom["timezone"])) if len(parts) > 3 else today_in(classroom["timezone"])
+            await self.open_calendar(uid, cid, "view", base, kind=kind)
         elif action == "task":
             await self.task(uid, int(parts[1]), int(parts[2]))
         elif action == "taskdone":
@@ -316,7 +354,8 @@ class Application:
             cid = int(parts[1])
             self.diary.require(cid, uid, "members")
             self.new_state(uid, "member_ids", cid)
-            await self.tg.send(uid, "Пришлите Telegram ID участников через пробел или контакт с Telegram ID. Номера телефонов не нужны.")
+            await self.tg.send(uid, "Пришлите Telegram ID участников через пробел или контакт с Telegram ID. Номера телефонов не нужны.",
+                               kb([b("Назад", f"members:{cid}")]))
         elif action == "remove":
             cid, target = int(parts[1]), int(parts[2])
             self.diary.require(cid, uid, "members")
@@ -353,7 +392,7 @@ class Application:
             _, data = self.need_state(uid, cid, parts[2], "role_edit")
             self.diary.require(cid, uid, "roles")
             self.db.set_state(uid, "role_name", data)
-            await self.tg.send(uid, "Введите название роли.")
+            await self.tg.send(uid, "Введите название роли.", kb([b("Назад к ролям", f"roles:{cid}")]))
         elif action == "roledelete":
             cid, rid = int(parts[1]), int(parts[2])
             self.diary.require(cid, uid, "roles")
@@ -374,8 +413,8 @@ class Application:
         elif action == "override":
             cid = int(parts[1])
             self.diary.require(cid, uid, "schedule")
-            self.new_state(uid, "override_date", cid)
-            await self.tg.send(uid, "На какую дату нужна замена? Введите ДД.ММ.ГГГГ.")
+            classroom = self.diary.require(cid, uid, "schedule")
+            await self.open_calendar(uid, cid, "override", today_in(classroom["timezone"]))
         elif action == "scheduleconfirm":
             cid = int(parts[1])
             _, data = self.need_state(uid, cid, parts[2], "schedule_confirm")
@@ -392,7 +431,7 @@ class Application:
                 raise ValueError("Это недельное расписание, а не замена.")
             self.diary.clear_override(cid, uid, date.fromisoformat(data["day"]))
             self.db.clear_state(uid)
-            await self.tg.send(uid, "Замена отменена: действует недельное расписание.")
+            await self.tg.send(uid, "Замена отменена: действует недельное расписание.", kb([b("К расписанию", f"scheduleedit:{cid}")]))
         elif action == "template":
             cid = int(parts[1])
             self.diary.require(cid, uid, "schedule")
@@ -419,11 +458,12 @@ class Application:
             await self.tg.send(uid, "Выберите группу, в которую бот уже добавлен. Вы должны быть её администратором.",
                                {"keyboard": [[{"text": "Выбрать группу", "request_chat": {"request_id": request_id, "chat_is_channel": False,
                                                                                            "bot_is_member": True, "request_title": True}}]], "resize_keyboard": True})
+            await self.tg.send(uid, "Откройте окно выбора группы кнопкой под полем ввода.", kb([b("Назад", f"bind:{cid}")]))
         elif action == "zone":
             cid = int(parts[1])
             self.diary.require(cid, uid, "settings")
             self.new_state(uid, "timezone", cid)
-            await self.tg.send(uid, "Введите часовой пояс: Europe/Moscow, UTC или смещение +03:00.")
+            await self.tg.send(uid, "Введите часовой пояс: Europe/Moscow, UTC или смещение +03:00.", kb([b("Назад", f"manage:{cid}")]))
         elif action == "interactive":
             cid = int(parts[1])
             self.diary.require(cid, uid, "settings")
@@ -434,7 +474,7 @@ class Application:
             self.diary.require(cid, uid, "announcements")
             self.new_state(uid, "announcement", cid, body="", attachments=[])
             await self.tg.send(uid, "Пришлите текст и материалы объявления. Оно отправится участникам в личку и в привязанную группу только после подтверждения.",
-                               kb([b("Предпросмотр", f"annpreview:{cid}")]))
+                               kb([b("Предпросмотр", f"annpreview:{cid}")], [b("Отмена", f"manage:{cid}")]))
         elif action == "annpreview":
             await self.announcement_preview(uid, int(parts[1]))
         elif action == "annpublish":
@@ -442,7 +482,20 @@ class Application:
             _, data = self.need_state(uid, cid, parts[2], "announcement")
             aid = self.diary.announce(cid, uid, data["body"], data["attachments"])
             self.db.clear_state(uid)
-            await self.tg.send(uid, f"Объявление #{aid} сохранено и поставлено в очередь отправки.", kb([b("В меню", f"home:{cid}")]))
+            group_delivery = self.db.one("SELECT id FROM deliveries WHERE class_id=? AND kind='announcement' AND recipient<0 AND unique_key LIKE ?",
+                                         (cid, f"ann:{aid}:%"))
+            if group_delivery:
+                await self.deliver_pending(delivery_id=group_delivery["id"])
+            delivery_state = self.db.scalar("SELECT state FROM deliveries WHERE id=?", (group_delivery["id"],)) if group_delivery else None
+            if delivery_state == "sent":
+                status = "Опубликовано в группе с упоминаниями участников."
+            elif delivery_state == "failed":
+                status = "Сохранено, но отправить в группу не удалось. Проверьте права бота в группе."
+            elif group_delivery:
+                status = "Сохранено. Отправка в группу повторится автоматически."
+            else:
+                status = "Сохранено. Для публикации в группе сначала привяжите её в управлении классом."
+            await self.tg.send(uid, f"✅ <b>Объявление #{aid}</b>\n{status}\nЛичные уведомления отправляются отдельно.", kb([b("К объявлениям", f"news:{cid}")], [b("В меню", f"home:{cid}")]))
         elif action == "news":
             await self.news(uid, int(parts[1]))
         elif action == "newsone":
@@ -461,7 +514,8 @@ class Application:
             await self.reminders(uid)
         elif action == "remindertime":
             self.new_state(uid, "reminder_time")
-            await self.tg.send(uid, "Во сколько напоминать? Например 18:00. Время считается по часовому поясу каждого вашего класса.")
+            await self.tg.send(uid, "Во сколько напоминать? Например 18:00. Время считается по часовому поясу каждого вашего класса.",
+                               kb([b("Назад", "reminders")]))
         elif action == "reminderoff":
             self.db.run("UPDATE users SET reminder_time=NULL WHERE id=?", (uid,))
             await self.reminders(uid)
@@ -516,7 +570,110 @@ class Application:
         await self.tg.send(uid, f"⚙️ <b>{e(classroom['name'])}</b>\nЧасовой пояс: {e(classroom['timezone'])}\n"
                            f"Группа: {e(classroom['group_title'] or 'не привязана')}", {"inline_keyboard": rows})
 
-    async def record(self, uid, cid, scope, assigned=None):
+    async def open_calendar(self, uid, cid, purpose, base, **extra):
+        permission = "schedule" if purpose == "override" else ("homework" if purpose == "record" and extra.get("scope") == "hw" else None)
+        self.diary.require(cid, uid, permission)
+        data = self.new_state(uid, "date_picker", cid, purpose=purpose, base_on=base.isoformat(),
+                              month=base.replace(day=1).isoformat(), **extra)
+        await self.calendar_preview(uid, data)
+
+    async def calendar_preview(self, uid, data):
+        cid, nonce = data["cid"], data["nonce"]
+        classroom = self.diary.require(cid, uid)
+        today = today_in(classroom["timezone"])
+        cursor = date.fromisoformat(data["month"])
+        titles = {"record": "Когда задали домашку?", "view": "На какой день показать?",
+                  "due": "К какому дню выполнить?", "override": "На какой день нужна замена?"}
+        months = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
+        rows = [[b(name, "noop") for name in SHORT_DAYS]]
+        for week in calendar.Calendar(firstweekday=0).monthdatescalendar(cursor.year, cursor.month):
+            row = []
+            for day in week:
+                if day.month != cursor.month:
+                    row.append(b("·", "noop"))
+                else:
+                    label = f"[{day.day}]" if day == today else str(day.day)
+                    if data["purpose"] == "due" and day < date.fromisoformat(data["draft"]["assigned_on"]):
+                        row.append(b("·", "noop"))
+                    else:
+                        row.append(b(label, f"cal:{cid}:{nonce}:pick:{day}"))
+            rows.append(row)
+        previous = (cursor-timedelta(days=1)).replace(day=1)
+        following = (cursor+timedelta(days=32)).replace(day=1)
+        rows.append([b("◀️ Месяц", f"cal:{cid}:{nonce}:month:{previous}"), b("Месяц ▶️", f"cal:{cid}:{nonce}:month:{following}")])
+        quick = []
+        for offset, label in ((-1, "Вчера"), (0, "Сегодня"), (1, "Завтра")):
+            day = today+timedelta(days=offset)
+            if data["purpose"] != "due" or day >= date.fromisoformat(data["draft"]["assigned_on"]):
+                quick.append(b(f"{label} · {day:%d.%m}", f"cal:{cid}:{nonce}:pick:{day}"))
+        if quick:
+            rows.append(quick)
+        rows.append([b("Назад", f"cal:{cid}:{nonce}:back")])
+        await self.tg.send(uid, f"📆 <b>{titles[data['purpose']]}</b>\n{months[cursor.month-1]} {cursor.year}\n\n"
+                           f"Сегодня: <b>{date_label(today)}</b>.\nВыберите число или перейдите к другому месяцу.", {"inline_keyboard": rows})
+
+    async def calendar_action(self, uid, cid, nonce, action, value):
+        _, data = self.need_state(uid, cid, nonce, "date_picker")
+        self.diary.require(cid, uid)
+        purpose = data["purpose"]
+        if action == "month":
+            cursor = date.fromisoformat(value)
+            if not 2000 <= cursor.year <= 2100:
+                raise ValueError("Выберите дату с 2000 по 2100 год.")
+            data["month"] = cursor.replace(day=1).isoformat()
+            self.db.set_state(uid, "date_picker", data)
+            return await self.calendar_preview(uid, data)
+        if action == "back":
+            if purpose == "record":
+                return await self.record(uid, cid, data["scope"], date.fromisoformat(data["base_on"]))
+            if purpose == "due":
+                self.db.set_state(uid, "draft", data)
+                return await self.draft_preview(uid)
+            self.db.clear_state(uid)
+            if purpose == "override":
+                return await self.schedule_menu(uid, cid)
+            return await self.view(uid, cid, data["kind"], data["base_on"])
+        if action != "pick":
+            raise ValueError("Неизвестное действие календаря.")
+        day = date.fromisoformat(value)
+        if purpose == "record":
+            return await self.record(uid, cid, data["scope"], day)
+        if purpose == "view":
+            self.db.clear_state(uid)
+            return await self.view(uid, cid, data["kind"], day.isoformat())
+        if purpose == "override":
+            return await self.schedule_input(uid, cid, day=day)
+        draft = data["draft"]
+        self.diary.require(cid, uid, "homework" if draft["owner_id"] == 0 else None)
+        if day < date.fromisoformat(draft["assigned_on"]):
+            raise ValueError("Дата выполнения не может быть раньше дня, когда задание задали.")
+        matches = self.target_lessons(cid, draft, day)
+        draft.update(due_on=day.isoformat(), due_position=matches[0]["position"] if matches else 0)
+        self.db.set_state(uid, "draft", data)
+        await self.draft_preview(uid)
+
+    def target_lessons(self, cid, draft, day):
+        return [row for row in self.diary.lessons_on(cid, day) if row["subject"].casefold() == draft["subject"].casefold()
+                and (not draft["audience_id"] or row["audience_id"] in (0, draft["audience_id"]))]
+
+    async def week_view(self, uid, cid, target="today"):
+        classroom = self.diary.require(cid, uid)
+        anchor = parse_date(target, today_in(classroom["timezone"]))
+        monday = anchor-timedelta(days=anchor.weekday())
+        lines = [f"📅 <b>{e(classroom['name'])} · расписание недели</b>", f"{monday:%d.%m}–{monday+timedelta(days=6):%d.%m.%Y}", ""]
+        rows = []
+        for index in range(7):
+            day = monday+timedelta(days=index)
+            lessons = self.diary.visible_lessons(cid, uid, day)
+            lines.append(f"<b>{DAYS[index]} · {day:%d.%m}</b>")
+            lines.append("\n".join(e(lesson_label(row)) for row in lessons) if lessons else "Выходной")
+            lines.append("")
+            rows.append([b(f"{SHORT_DAYS[index]} · {day:%d.%m} — подробно", f"v:{cid}:schedule:{day}")])
+        rows += [[b("◀️ Неделя", f"week:{cid}:{monday-timedelta(days=7)}"), b("Неделя ▶️", f"week:{cid}:{monday+timedelta(days=7)}")],
+                 [b("Текущая неделя", f"week:{cid}:today"), b("В меню", f"home:{cid}")]]
+        await self.send_long(uid, "\n".join(lines), {"inline_keyboard": rows})
+
+    async def record(self, uid, cid, scope, assigned=None, saved_due=None):
         if scope not in ("hw", "mine"):
             raise ValueError("Неизвестный тип записи.")
         classroom = self.diary.require(cid, uid, "homework" if scope == "hw" else None)
@@ -529,11 +686,13 @@ class Application:
         for index, lesson in enumerate(lessons):
             existing = self.diary.existing_assignment(cid, uid, owner, lesson["source_key"], assigned)
             rows.append([b(("✅ " if existing else "✏️ ") + lesson_label(lesson), f"lesson:{cid}:{nonce}:{index}")])
-        rows.append([b("📆 Другой день записи", f"recorddate:{cid}:{nonce}")])
+        rows.append([b("📆 Выбрать другой день", f"recorddate:{cid}:{nonce}")])
         if scope == "mine":
             rows.append([b("➕ Свой предмет / заметка", f"custom:{cid}:{nonce}")])
         rows.append([b("В меню", f"home:{cid}")])
-        message = f"<b>{'Общее ДЗ' if scope == 'hw' else 'Личная запись'} · {date_label(assigned)}</b>\nВыберите урок, на котором задание задали."
+        message = f"<b>{'Общее ДЗ' if scope == 'hw' else 'Личная запись'} · {date_label(assigned)}</b>\nВыберите предмет. Номер и подгруппа уже указаны в кнопке."
+        if saved_due:
+            message = f"✅ Сохранено к {date.fromisoformat(saved_due):%d.%m.%Y}.\n\n" + message
         if not lessons:
             message += "\nУроков на этот день нет. Выберите другой день или заполните расписание."
         await self.tg.send(uid, message, {"inline_keyboard": rows})
@@ -558,8 +717,8 @@ class Application:
                          due_on=due.isoformat() if due else "", due_position=position, body="", attachments=[], no_homework=False, revision=0)
         data = self.new_state(uid, "draft", cid, draft=draft)
         if not draft["due_on"]:
-            self.db.set_state(uid, "draft_date", data)
-            await self.tg.send(uid, "Следующего урока в расписании нет. Введите дату выполнения ДД.ММ.ГГГГ.")
+            classroom = self.diary.require(cid, uid)
+            await self.open_calendar(uid, cid, "due", today_in(classroom["timezone"]), draft=draft)
         else:
             await self.draft_preview(uid)
 
@@ -578,10 +737,10 @@ class Application:
         text += f"\n\n{body}\n\n📎 Вложений: {len(draft['attachments'])}\n"
         text += "Пришлите текст, фото или файлы — они добавятся в черновик. Сохранение только по кнопке."
         rows = [[b("💾 Сохранить", f"draft:{cid}:{nonce}:save")],
-                [b("📆 Изменить срок", f"draft:{cid}:{nonce}:date"), b("№ урока к сдаче", f"draft:{cid}:{nonce}:position")],
+                [b("📆 Изменить дату выполнения", f"draft:{cid}:{nonce}:date")],
                 [b("Ничего не задано", f"draft:{cid}:{nonce}:none")],
-                [b("Очистить текст", f"draft:{cid}:{nonce}:textclear"), b("Убрать вложения", f"draft:{cid}:{nonce}:mediaclear")],
-                [b("Отмена", f"home:{cid}")]]
+                [b("Ещё / исправить", f"draft:{cid}:{nonce}:more")],
+                [b("Назад к предметам", f"recordagain:{cid}:{nonce}")]]
         await self.send_long(uid, text, {"inline_keyboard": rows})
 
     async def draft_action(self, uid, cid, nonce, action):
@@ -589,20 +748,33 @@ class Application:
         draft = data["draft"]
         self.diary.require(cid, uid, "homework" if draft["owner_id"] == 0 else None)
         if action == "save":
-            aid = self.diary.save_assignment(cid, uid, draft)
+            self.diary.save_assignment(cid, uid, draft)
             scope = "hw" if draft["owner_id"] == 0 else "mine"
             assigned = date.fromisoformat(draft["assigned_on"])
             self.db.clear_state(uid)
-            await self.tg.send(uid, f"✅ {'Общее ДЗ' if scope == 'hw' else 'Личная запись'} сохранено к {date.fromisoformat(draft['due_on']):%d.%m.%Y}. "
-                               "В группу сообщение не отправлялось.", kb([b("Открыть задание", f"task:{cid}:{aid}")]))
-            return await self.record(uid, cid, scope, assigned)
+            return await self.record(uid, cid, scope, assigned, saved_due=draft["due_on"])
         if action == "preview":
             return await self.draft_preview(uid)
-        if action in ("date", "position"):
-            self.db.set_state(uid, "draft_date" if action == "date" else "draft_position", data)
-            await self.tg.send(uid, "Введите дату выполнения ДД.ММ.ГГГГ." if action == "date" else "Введите номер урока, к которому нужно выполнить задание (1–16), или 0 — без привязки к номеру.")
+        if action == "date":
+            return await self.open_calendar(uid, cid, "due", date.fromisoformat(draft["due_on"]), draft=draft)
+        if action == "more":
+            rows = [[b("Очистить текст", f"draft:{cid}:{nonce}:textclear"), b("Убрать вложения", f"draft:{cid}:{nonce}:mediaclear")],
+                    [b("Выбрать урок к сдаче", f"draft:{cid}:{nonce}:position")], [b("Назад", f"draft:{cid}:{nonce}:preview")]]
+            await self.tg.send(uid, "Что изменить в черновике?", {"inline_keyboard": rows})
             return
-        if action == "none":
+        if action == "position":
+            matches = self.target_lessons(cid, draft, date.fromisoformat(draft["due_on"]))
+            rows = [[b(lesson_label(row), f"draft:{cid}:{nonce}:slot{row['position']}")] for row in matches]
+            rows += [[b("Без привязки к номеру", f"draft:{cid}:{nonce}:slot0")], [b("Назад", f"draft:{cid}:{nonce}:preview")]]
+            await self.tg.send(uid, "К какому уроку этого дня нужно выполнить задание?", {"inline_keyboard": rows})
+            return
+        if action.startswith("slot"):
+            position = int(action[4:])
+            valid = {row["position"] for row in self.target_lessons(cid, draft, date.fromisoformat(draft["due_on"]))}
+            if position and position not in valid:
+                raise ValueError("Выберите урок из предложенных вариантов.")
+            draft["due_position"] = position
+        elif action == "none":
             draft.update(no_homework=True, body="", attachments=[])
         elif action == "textclear":
             draft.update(no_homework=False, body="")
@@ -615,6 +787,8 @@ class Application:
 
     async def view(self, uid, cid, kind, target):
         classroom = self.diary.require(cid, uid)
+        if kind == "week":
+            return await self.week_view(uid, cid, target)
         if kind == "stats":
             return await self.stats(uid, cid)
         if kind not in ("hw", "mine", "schedule"):
@@ -633,9 +807,11 @@ class Application:
                     label += f" · {row['audience']}"
                 label += f" · #{row['id']}"
                 rows.append([b(label, f"task:{cid}:{row['id']}")])
-        rows += [[b("◀️", f"v:{cid}:{kind}:{day-timedelta(days=1)}"), b("📆 Дата", f"askdate:{cid}:{kind}"), b("▶️", f"v:{cid}:{kind}:{day+timedelta(days=1)}")],
+        rows += [[b("◀️", f"v:{cid}:{kind}:{day-timedelta(days=1)}"), b("📆 Дата", f"askdate:{cid}:{kind}:{day}"), b("▶️", f"v:{cid}:{kind}:{day+timedelta(days=1)}")],
                  [b("Сегодня", f"v:{cid}:{kind}:today"), b("Завтра", f"v:{cid}:{kind}:tomorrow")],
                  [b("🔄 Обновить", f"v:{cid}:{kind}:{day}")], [b("В меню", f"home:{cid}")]]
+        if kind == "schedule":
+            rows.insert(0, [b("📅 Вся неделя", f"week:{cid}:{day}")])
         # Telegram permits at most 100 inline buttons in a keyboard.
         if sum(map(len, rows)) > 95:
             rows = rows[:85] + rows[-4:]
@@ -724,7 +900,8 @@ class Application:
                            {"keyboard": [[{"text": "Выбрать участников", "request_users": {"request_id": request_id, "user_is_bot": False,
                                                                                            "max_quantity": 10, "request_name": True, "request_username": True}}],
                                          [{"text": "/cancel"}]], "resize_keyboard": True})
-        await self.tg.send(uid, "Если окно выбора недоступно:", kb([b("Добавить по Telegram ID", f"memberids:{cid}")]))
+        await self.tg.send(uid, "Если окно выбора недоступно, добавьте участников по Telegram ID.",
+                           kb([b("Добавить по Telegram ID", f"memberids:{cid}")], [b("Назад", f"members:{cid}")]))
 
     async def shared_users(self, uid, shared):
         stage, data = self.db.state(uid)
@@ -732,7 +909,8 @@ class Application:
             raise ValueError("Запрос выбора устарел. Откройте добавление участников заново.")
         users = shared.get("users", [])
         self.diary.add_members(data["cid"], uid, users)
-        await self.tg.send(uid, f"Добавлено или уже было в классе: {len(users)}. Можно выбрать ещё участников или нажать /cancel.")
+        await self.tg.send(uid, f"Добавлено или уже было в классе: {len(users)}. Можно выбрать ещё участников кнопкой под полем ввода.",
+                           kb([b("Готово", f"members:{data['cid']}")]))
 
     async def roles(self, uid, cid):
         rows = [[b(role["name"], f"role:{cid}:{role['id']}")] for role in self.diary.roles(cid, uid)]
@@ -749,7 +927,7 @@ class Application:
         if row:
             await self.role_preview(uid, data)
         else:
-            await self.tg.send(uid, "Введите название новой роли.")
+            await self.tg.send(uid, "Введите название новой роли.", kb([b("Назад", f"roles:{cid}")]))
 
     async def role_preview(self, uid, data):
         cid, nonce = data["cid"], data["nonce"]
@@ -777,6 +955,8 @@ class Application:
                                "WHERE l.class_id=? AND l.weekday=? AND archived=0 ORDER BY position,audience_id", (cid, weekday))
         text = "\n".join("<code>" + e(f"{r['position']}; {r['subject']}; {r['audience']}; {r['starts']+'-'+r['ends'] if r['starts'] else ''}; {r['room']}") + "</code>" for r in rows)
         title = date_label(day) if day else DAYS[weekday]
+        buttons = [[b("Убрать замену на дату", f"clearoverride:{cid}:{data['nonce']}")]] if day else []
+        buttons.append([b("Назад", f"scheduleedit:{cid}")])
         await self.send_long(uid, f"<b>{title}</b>\n\nТекущее расписание:\n{text if text else 'Уроков нет'}\n\n"
                              "Пришлите весь день одним сообщением, по уроку на строку:\n"
                              "<code>1; Алгебра; ; 09:00-09:45; 12</code>\n"
@@ -784,7 +964,7 @@ class Application:
                              "<code>2; Информатика; Группа 2; 10:05-10:50</code>\n\n"
                              "Подгруппа, время и кабинет необязательны. Без подгруппы урок общий. Для выходного пришлите «выходной».\n"
                              "Будет предпросмотр перед сохранением.",
-                             kb([b("Убрать замену на дату", f"clearoverride:{cid}:{data['nonce']}")]) if day else None)
+                             {"inline_keyboard": buttons})
 
     async def bind_menu(self, uid, cid):
         classroom = self.diary.require(cid, uid, "settings")
@@ -836,9 +1016,9 @@ class Application:
                 raise ValueError("Введите название текстом.")
             cid = self.diary.create_class(uid, text, self.config.default_timezone, self.config.max_classes_per_owner)
             self.db.clear_state(uid)
-            await self.tg.send(uid, "Класс создан. Вы — его владелец. Можно загрузить расписание 9Б с фотографии либо составить своё.",
-                               kb([b("Загрузить расписание 9Б", f"template:{cid}")], [b("Составить своё", f"scheduleedit:{cid}")]))
-            await self.home(uid, cid)
+            await self.tg.send(uid, f"🏫 <b>{e(text)}</b>\nКласс создан. Вы — его владелец. Добавьте участников и настройте расписание.",
+                               kb([b("Добавить участников", f"addmembers:{cid}")], [b("Загрузить расписание 9Б", f"template:{cid}")],
+                                  [b("Составить своё расписание", f"scheduleedit:{cid}")], [b("В меню класса", f"home:{cid}")]))
         elif stage == "record_date":
             assigned = parse_date(text, today_in(classroom["timezone"]))
             await self.record(uid, cid, data["scope"], assigned)
@@ -877,9 +1057,7 @@ class Application:
                 raise ValueError("Максимум 6000 символов и 20 вложений. Черновик не изменён.")
             draft.update(body=combined, attachments=draft["attachments"]+media, no_homework=False)
             self.db.set_state(uid, "draft", data)
-            # Albums arrive as multiple updates. One compact acknowledgement keeps the latest Save button available.
-            await self.tg.send(uid, f"Добавлено. Текст: {len(combined)} символов · вложений: {len(draft['attachments'])}.",
-                               kb([b("Предпросмотр", f"draft:{cid}:{data['nonce']}:preview"), b("💾 Сохранить", f"draft:{cid}:{data['nonce']}:save")]))
+            await self.draft_preview(uid)
         elif stage == "view_date":
             target = parse_date(text, today_in(classroom["timezone"]))
             self.db.clear_state(uid)
@@ -895,7 +1073,7 @@ class Application:
                     raise ValueError("Пришлите до 50 числовых Telegram ID через пробел.")
                 users = [{"user_id": int(x)} for x in ids]
             self.diary.add_members(cid, uid, users)
-            await self.tg.send(uid, f"Добавлено или уже было: {len(users)}. Можно отправить ещё ID или нажать /cancel.")
+            await self.tg.send(uid, f"Добавлено или уже было: {len(users)}. Можно отправить ещё ID.", kb([b("Готово", f"members:{cid}")]))
         elif stage == "role_name":
             self.diary.require(cid, uid, "roles")
             if not 1 <= len(text) <= 50:
@@ -931,7 +1109,8 @@ class Application:
                 raise ValueError("Максимум 6000 символов и 20 вложений.")
             data.update(body=combined, attachments=data["attachments"]+media)
             self.db.set_state(uid, "announcement", data)
-            await self.tg.send(uid, f"Добавлено. Вложений: {len(data['attachments'])}.", kb([b("Предпросмотр", f"annpreview:{cid}")]))
+            await self.tg.send(uid, f"Добавлено. Вложений: {len(data['attachments'])}.",
+                               kb([b("Предпросмотр", f"annpreview:{cid}")], [b("Отмена", f"manage:{cid}")]))
         elif stage == "reminder_time":
             import re
             if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
@@ -940,7 +1119,7 @@ class Application:
             self.db.clear_state(uid)
             await self.reminders(uid)
         else:
-            await self.tg.send(uid, "Для следующего шага нажмите нужную кнопку выше. Для отмены: /cancel.")
+            await self.tg.send(uid, "Для следующего шага нажмите нужную кнопку. Для отмены: /cancel.", kb([b("В меню", "classes")]))
 
     async def announcement_preview(self, uid, cid):
         self.diary.require(cid, uid, "announcements")
@@ -948,7 +1127,8 @@ class Application:
         if stage != "announcement" or data.get("cid") != cid:
             raise ValueError("Черновик объявления не найден.")
         await self.send_long(uid, f"📢 <b>Предпросмотр объявления</b>\n\n{text_lines(data['body']) or 'Текст не добавлен.'}\n\n"
-                             f"Вложений: {len(data['attachments'])}\nПосле публикации участникам придёт уведомление.",
+                             f"Вложений: {len(data['attachments'])}\nОбъявление сразу появится в привязанной группе с упоминаниями участников класса. "
+                             "Участники, запустившие бота, также получат личное уведомление.",
                              kb([b("📢 Опубликовать", f"annpublish:{cid}:{data['nonce']}")], [b("Отмена", f"home:{cid}")]))
 
     async def news(self, uid, cid):
@@ -976,7 +1156,8 @@ class Application:
             raise ValueError("Объявление не найдено.")
         rows = self.db.all("SELECT u.name FROM announcement_reads ar JOIN users u ON u.id=ar.user_id "
                            "JOIN members m ON m.class_id=? AND m.user_id=ar.user_id WHERE ar.announcement_id=? ORDER BY u.name", (cid, aid))
-        await self.send_long(uid, f"<b>Отметили «Ознакомился»: {len(rows)}</b>\n" + "\n".join(e(r["name"]) for r in rows))
+        await self.send_long(uid, f"<b>Отметили «Ознакомился»: {len(rows)}</b>\n" + "\n".join(e(r["name"]) for r in rows),
+                             kb([b("Назад к объявлению", f"newsone:{cid}:{aid}")]))
 
     async def reminders(self, uid):
         clock = self.db.scalar("SELECT reminder_time FROM users WHERE id=?", (uid,))
@@ -1054,13 +1235,32 @@ class Application:
                     self.diary.queue(f"reminder:{classroom['id']}:{user['id']}:{local.date()}", classroom["id"], user["id"],
                                      "reminder", {"day": tomorrow.isoformat()})
 
-    async def deliver_pending(self):
-        deliveries = self.db.all("SELECT * FROM deliveries WHERE state='pending' AND retry_after<=? ORDER BY id LIMIT 20", (time.time(),))
+    def mention_members(self, cid):
+        members = self.db.all("SELECT u.id,u.name FROM users u JOIN members m ON m.user_id=u.id WHERE m.class_id=? ORDER BY u.name,u.id", (cid,))
+        lines, line = [], ""
+        for member in members:
+            tag = f'<a href="tg://user?id={member["id"]}">{e(member["name"][:40])}</a>'
+            if line and len(line)+len(tag)+2 > 1000:
+                lines.append(line)
+                line = ""
+            line += (" · " if line else "")+tag
+        if line:
+            lines.append(line)
+        return "\n".join(lines)
+
+    async def deliver_pending(self, delivery_id=None):
+        if delivery_id is None:
+            deliveries = self.db.all("SELECT * FROM deliveries WHERE state='pending' AND retry_after<=? ORDER BY recipient<0 DESC,id LIMIT 20", (time.time(),))
+        else:
+            deliveries = self.db.all("SELECT * FROM deliveries WHERE id=? AND state='pending' AND retry_after<=?", (delivery_id, time.time()))
         for delivery in deliveries:
+            if not self.db.run("UPDATE deliveries SET state='sending' WHERE id=? AND state='pending'", (delivery["id"],)).rowcount:
+                continue
             cid, recipient = delivery["class_id"], delivery["recipient"]
             classroom = self.db.one("SELECT * FROM classes WHERE id=?", (cid,))
             payload = json.loads(delivery["payload"])
             if not classroom:
+                self.db.run("UPDATE deliveries SET state='cancelled' WHERE id=?", (delivery["id"],))
                 continue
             if recipient > 0:
                 if not self.db.scalar("SELECT 1 FROM members m JOIN users u ON u.id=m.user_id WHERE m.class_id=? AND m.user_id=? AND m.active=1 AND u.started=1", (cid, recipient)):
@@ -1074,7 +1274,8 @@ class Application:
                     row = self.db.one("SELECT * FROM announcements WHERE id=? AND class_id=?", (payload["id"], cid))
                     if row:
                         await self.send_media(recipient, json.loads(row["attachments"]))
-                        await self.send_long(recipient, f"📢 <b>{e(classroom['name'])} · важное объявление</b>\n\n{text_lines(row['body']) or 'Материалы во вложениях.'}",
+                        mentions = "\n\n<b>Участники класса:</b>\n"+self.mention_members(cid) if recipient < 0 else ""
+                        await self.send_long(recipient, f"📢 <b>{e(classroom['name'])} · важное объявление</b>\n\n{text_lines(row['body']) or 'Материалы во вложениях.'}{mentions}",
                                              kb([b("✅ Ознакомился", f"ack:{cid}:{row['id']}")]))
                 elif delivery["kind"] == "reminder":
                     user = self.db.one("SELECT reminder_time FROM users WHERE id=?", (recipient,))
@@ -1097,11 +1298,16 @@ class Application:
 
     async def background(self):
         last_reminders = 0.0
+        last_cleanup = 0.0
         while True:
             try:
                 if time.monotonic() - last_reminders > 30:
                     self.schedule_reminders()
                     last_reminders = time.monotonic()
+                if time.monotonic() - last_cleanup > 3600:
+                    self.diary.purge_old_homework(self.config.homework_retention_days)
+                    self.tg.cleanup()
+                    last_cleanup = time.monotonic()
                 await self.deliver_pending()
             except asyncio.CancelledError:
                 raise
