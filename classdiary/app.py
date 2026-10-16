@@ -1105,3 +1105,11 @@ class Application:
             except Exception as exc:
                 log.error("Background task failed: %s", type(exc).__name__)
             await asyncio.sleep(2)
+
+
+if __name__ == "__main__":
+    # Some hosts detect the package's app module as the entry point.
+    # Delegate to the same CLI used by run.py instead of exiting after imports.
+    from run import main
+
+    raise SystemExit(main())
