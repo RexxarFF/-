@@ -27,8 +27,9 @@ class GroupInteractive:
     def name(self, uid):
         return e((self.db.scalar("SELECT name FROM users WHERE id=?", (uid,)) or str(uid))[:50])
 
-    async def screen(self, message, text, keyboard, edit=False):
+    async def screen(self, message, text, keyboard, edit=False, cid=None, uid=None):
         if edit and message.get("message_id"):
+            self.app.require_group_owner(message, uid, cid, uid)
             try:
                 return await self.app.tg.call("editMessageText", chat_id=message["chat"]["id"],
                                               message_id=message["message_id"], text=text, parse_mode="HTML",
@@ -39,7 +40,7 @@ class GroupInteractive:
                     return
                 if exc.code != 400 or not any(x in description for x in ("message to edit not found", "message can't be edited", "message can not be edited")):
                     raise
-        return await self.app.send_group(message, text, keyboard)
+        return await self.app.send_owned_group(message, text, keyboard, cid, uid)
 
     async def show(self, uid, cid, kind, message, edit=False, page=0):
         classroom = self.require(cid, uid, message)
@@ -61,7 +62,7 @@ class GroupInteractive:
         text += "\n\nСчитаются сообщения участников класса с момента включения учёта."
         return await self.screen(message, text, kb([b("🔥 Мои огоньки", self.data(cid, uid, "p", 0))],
                                                   [b("🔄 Обновить", self.data(cid, uid, "s"))],
-                                                  [b("📚 ДЗ в личку", f"v:{cid}:hw:tomorrow")]), edit)
+                                                  [b("В меню", self.data(cid, uid, "m"))]), edit, cid, uid)
 
     async def pairs(self, uid, cid, classroom, message, edit, page):
         pairs = sorted(self.diary.pairs(cid, uid, today_in(classroom["timezone"])), key=lambda row: row["id"])
@@ -76,12 +77,12 @@ class GroupInteractive:
             elif pair["requester"] == uid:
                 lines.append(f"{name} — ожидаем согласия")
             else:
-                lines.append(f"{name} — приглашает вас")
+                lines.append(f"{name} — приглашает тебя")
                 rows.append([b("Принять", self.data(cid, uid, "a", pair["id"], 1)),
                              b("Отклонить", self.data(cid, uid, "a", pair["id"], 0))])
             rows.append([b(f"Убрать: {pair['name']}", self.data(cid, uid, "x", pair["id"]))])
         if not pairs:
-            lines.append("Огоньков пока нет. Пригласите участника класса.")
+            lines.append("Огоньков пока нет. Пригласи участника класса.")
         navigation = []
         if page:
             navigation.append(b("◀️", self.data(cid, uid, "p", page-1)))
@@ -90,8 +91,8 @@ class GroupInteractive:
         if navigation:
             rows.append(navigation)
         rows.extend([[b("➕ Пригласить участника", self.data(cid, uid, "c", 0))],
-                     [b("📊 Моя статистика", self.data(cid, uid, "s"))]])
-        return await self.screen(message, "\n".join(lines), {"inline_keyboard": rows}, edit)
+                     [b("📊 Моя статистика", self.data(cid, uid, "s"))], [b("В меню", self.data(cid, uid, "m"))]])
+        return await self.screen(message, "\n".join(lines), {"inline_keyboard": rows}, edit, cid, uid)
 
     async def choose(self, uid, cid, message, edit, page):
         members = [row for row in self.diary.members(cid, uid) if row["active"] and row["id"] != uid]
@@ -105,20 +106,23 @@ class GroupInteractive:
         if navigation:
             rows.append(navigation)
         rows.append([b("Назад", self.data(cid, uid, "p", 0))])
-        return await self.screen(message, f"🔥 <b>{self.name(uid)}</b>\nВыберите участника для парного огонька.", {"inline_keyboard": rows}, edit)
+        return await self.screen(message, f"🔥 <b>{self.name(uid)}</b>\nВыбери участника для парного огонька.", {"inline_keyboard": rows}, edit, cid, uid)
 
     async def callback(self, query, parts):
         if len(parts) < 4:
             raise ValueError("Кнопка интерактива устарела.")
         cid, owner, action = int(parts[1]), int(parts[2]), parts[3]
-        lengths = {"s": 4, "p": 5, "c": 5, "r": 5, "a": 6, "x": 5}
+        lengths = {"s": 4, "p": 5, "c": 5, "r": 5, "a": 6, "x": 5, "m": 4}
         if action not in lengths or len(parts) != lengths[action] or (action == "a" and parts[5] not in ("0", "1")):
-            raise ValueError("Кнопка интерактива устарела. Откройте /pairs заново.")
+            raise ValueError("Кнопка интерактива устарела. Открой /pairs заново.")
         uid, message = query["from"]["id"], query.get("message", {})
         self.require(cid, uid, message)
         if owner != uid:
-            raise AccessDenied("Это кнопки другого участника. Откройте /stats или /pairs для себя.")
-        if action == "s":
+            raise AccessDenied("Это кнопки другого участника. Открой /stats или /pairs для себя.")
+        self.app.require_group_owner(message, uid, cid, owner)
+        if action == "m":
+            await self.app.group_menu(uid, cid, message, edit=True)
+        elif action == "s":
             await self.show(uid, cid, "stats", message, edit=True)
         elif action in ("p", "c"):
             await self.show(uid, cid, "pairs" if action == "p" else "choose", message, edit=True,
@@ -131,15 +135,15 @@ class GroupInteractive:
             if not existing:
                 invitation = f'🔥 <a href="tg://user?id={uid}">{self.name(uid)}</a> предлагает '
                 invitation += f'<a href="tg://user?id={target}">{self.name(target)}</a> вести парный огонёк.\n'
-                invitation += "Оба участника должны писать в группе каждый день."
-                await self.app.send_group(message, invitation, kb([b("Принять", self.data(cid, target, "a", pid, 1)),
-                                                                   b("Отклонить", self.data(cid, target, "a", pid, 0))]))
+                invitation += "Серия растёт за дни, когда оба общаются в группе."
+                await self.app.send_owned_group(message, invitation, kb([b("Принять", self.data(cid, target, "a", pid, 1)),
+                                                                        b("Отклонить", self.data(cid, target, "a", pid, 0))]), cid, target)
             await self.show(uid, cid, "pairs", message, edit=True)
         elif action == "a":
             pid, accept = int(parts[4]), parts[5] == "1"
             pair = self.db.one("SELECT * FROM pairs WHERE class_id=? AND id=?", (cid, pid))
             if not pair or pair["accepted"]:
-                raise ValueError("Приглашение уже обработано. Откройте свои огоньки заново.")
+                raise ValueError("Приглашение уже обработано. Открой свои огоньки заново.")
             self.diary.answer_pair(cid, uid, pid, accept)
             await self.show(uid, cid, "pairs", message, edit=True)
         elif action == "x":

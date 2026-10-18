@@ -307,4 +307,4 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(min(r["position"] for r in template["week"]["4"]), 2)
         self.assertEqual(min(r["position"] for r in template["week"]["5"]), 2)
         self.assertEqual(template["week"]["0"][0]["starts"], "08:10")
-        self.assertEqual(template["week"]["6"], [])
+        self.assertNotIn("6", template["week"])

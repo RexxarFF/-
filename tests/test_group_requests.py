@@ -32,3 +32,25 @@ class GroupRequestTests(unittest.TestCase):
         self.assertEqual(parse_command("/start@class_bot\nbind_123", "class_bot"), ("/start", "bind_123"))
         self.assertEqual(parse_command("/menu@other_bot", "class_bot"), (None, ""))
         self.assertEqual(parse_command("@other_bot, что задано на завтра", "class_bot"), (None, ""))
+
+    def test_short_words_are_normalized_and_only_explicit_aliases_match(self):
+        for text, command in ((" МеНю?! ", "/menu"), ("ДЗ", "/hw"), ("расп", "/schedule"),
+                ("Моё   ДЗ", "/my"), ("стата!", "/stats"), ("Огонёк", "/pairs"),
+                ("пригласить всех", "/invite"), ("команды", "/help"), ("назад", "/cancel"),
+                ("@class_bot, меню", "/menu")):
+            with self.subTest(text=text):
+                self.assertEqual(parse_command(text, "class_bot"), (command, ""))
+        self.assertEqual(parse_command("@other_bot, меню", "class_bot"), (None, ""))
+        for text in ("это меню", "пригласить друзей на прогулку", "мы обсудили дз"):
+            self.assertNotIn(parse_command(text, "class_bot")[0], {"/menu", "/invite", "/hw"})
+
+    def test_draft_disables_word_aliases_except_exit(self):
+        for text in ("дз", "расп", "стата", "огоньки", "пригласить", "помощь"):
+            self.assertFalse(parse_command(text, "class_bot", allow_words=False)[0].startswith("/"))
+        for text, expected in (("меню", "/menu"), ("отмена", "/cancel"), ("назад", "/cancel"), ("/stats", "/stats")):
+            self.assertEqual(parse_command(text, "class_bot", allow_words=False)[0], expected)
+
+    def test_short_date_phrases_do_not_require_preposition(self):
+        for text, expected in (("дз сегодня", ("hw", "today")), ("домашка завтра", ("hw", "tomorrow")),
+                ("расп завтра", ("schedule", "tomorrow")), ("уроки сегодня", ("schedule", "today"))):
+            self.assertEqual(parse_group_request(text), expected)

@@ -58,10 +58,10 @@ class Config:
     homework_retention_days: int = 14
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls, require_token=True) -> "Config":
         load_env(ROOT / ".env")
         token = os.environ.get("BOT_TOKEN", "").strip()
-        if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", token):
+        if require_token and not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", token):
             raise ValueError("Укажите настоящий BOT_TOKEN в файле .env. Токен выдаёт @BotFather.")
         db = Path(os.environ.get("DATABASE_PATH", "data/diary.sqlite3"))
         if not db.is_absolute():

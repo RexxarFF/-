@@ -6,6 +6,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+from weakref import WeakValueDictionary
 
 
 class TelegramError(Exception):
@@ -24,8 +25,9 @@ class Telegram:
         self._context = ssl.create_default_context()
         self._send_lock = asyncio.Lock()
         self._last_send = float("-inf")
-        self._chat_locks = {}
+        self._chat_locks = WeakValueDictionary()
         self._chat_last = {}
+        self._last_cleanup = time.monotonic()
         self._clock = time.monotonic
         self._sleep = asyncio.sleep
 
@@ -36,6 +38,8 @@ class Telegram:
         try:
             with urllib.request.urlopen(request, timeout=45, context=self._context) as response:
                 result = json.load(response)
+        except (ValueError, UnicodeError):
+            raise TelegramError(0, "Telegram прислал неполный ответ. Попробуй ещё раз чуть позже.") from None
         except urllib.error.HTTPError as exc:
             try:
                 result = json.loads(exc.read())
@@ -44,12 +48,20 @@ class Telegram:
         except (urllib.error.URLError, TimeoutError, OSError):
             # urllib exceptions may contain the URL, including the bot token.
             raise TelegramError(0, "Нет соединения с Telegram. Проверьте доступ к api.telegram.org.") from None
+        if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+            raise TelegramError(0, "Telegram прислал неполный ответ. Попробуй ещё раз чуть позже.")
         if not result.get("ok"):
             raise TelegramError(result.get("error_code", 0), result.get("description", "Ошибка Telegram"),
                                 result.get("parameters", {}).get("retry_after", 0))
+        if "result" not in result:
+            raise TelegramError(0, "Telegram прислал неполный ответ. Попробуй ещё раз чуть позже.")
         return result["result"]
 
     async def call(self, method, **payload):
+        now = self._clock()
+        if now - self._last_cleanup >= 300:
+            self._chat_last = {chat: stamp for chat, stamp in self._chat_last.items() if now - stamp < 300}
+            self._last_cleanup = now
         if method.startswith(("send", "edit", "copy")):
             chat_id = payload.get("chat_id")
             if chat_id is not None:

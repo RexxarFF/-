@@ -52,7 +52,7 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(task.done())
                     menus = [data for method, data in calls if method == "sendMessage" and data["keyboard"] and "inline_keyboard" in data["keyboard"]]
                     self.assertEqual(menus[0]["chat_id"], 101)
-                    self.assertIn("Создайте класс", menus[0]["text"])
+                    self.assertIn("Попроси у ответственного приглашение", menus[0]["text"])
                     self.assertTrue(any(method == "getUpdates" for method, _ in calls))
                 finally:
                     task.cancel()
@@ -98,6 +98,8 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
                     return {"message_id": self.ids[chat_id], "chat": {"id": chat_id}}
                 if method == "editMessageText":
                     return {"message_id": payload["message_id"]}
+                if method == "getChatMember":
+                    return {"status": "member"}
                 return True
 
         with tempfile.TemporaryDirectory() as directory:
@@ -109,6 +111,7 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
             cid = diary.create_class(100, "9Б", "Europe/Moscow")
             diary.add_members(cid, 100, [{"user_id": 101}])
             diary.bind_group(cid, 100, -100, "9Б")
+            invite = diary.create_group_invite(cid, 100)
             diary.replace_weekday(cid, 100, 3, [{"position": 1, "subject": "Алгебра"}])
             diary.save_assignment(cid, 100, dict(owner_id=0, source_key="lesson:test", source_position=1,
                 assigned_on="2026-10-14", subject="Алгебра", audience_id=0, due_on="2026-10-15", due_position=1,
@@ -122,18 +125,28 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
                 updates.append({"update_id": index, "message": {"message_id": index, "date": 1791975600,
                     "from": user, "chat": {"id": -100, "type": "supergroup"}, "text": text}})
             updates.extend([
-                {"update_id": 25, "callback_query": {"id": "group-button", "from": user,
-                    "data": f"v:{cid}:hw:tomorrow", "message": {"message_id": 1, "chat": {"id": -100, "type": "supergroup"}}}},
-                {"update_id": 26, "callback_query": {"id": "private-back", "from": user,
-                    "data": f"home:{cid}", "message": {"message_id": 3, "chat": {"id": 101, "type": "private"}}}}
+                {"update_id": 25, "callback_query": {"id": "another-user", "from": {"id": 100, "first_name": "Владелец"},
+                    "data": f"m:{cid}:101:hw:tomorrow", "message": {"message_id": 1, "chat": {"id": -100, "type": "supergroup"}}}},
+                {"update_id": 26, "callback_query": {"id": "group-button", "from": user,
+                    "data": f"m:{cid}:101:hw:tomorrow", "message": {"message_id": 1, "chat": {"id": -100, "type": "supergroup"}}}},
+                {"update_id": 27, "callback_query": {"id": "private-back", "from": user,
+                    "data": f"home:{cid}", "message": {"message_id": 3, "chat": {"id": 101, "type": "private"}}}},
+                {"update_id": 28, "message": {"message_id": 28, "date": 1791975600,
+                    "from": {"id": 300, "first_name": "Новичок"}, "chat": {"id": 300, "type": "private"},
+                    "text": f"/start join_{invite['token']}"}},
+                {"update_id": 29, "message": {"message_id": 29, "date": 1791975600,
+                    "from": user, "chat": {"id": 101, "type": "private"}, "text": "меню"}},
+                {"update_id": 30, "callback_query": {"id": "older-private-back", "from": user,
+                    "data": f"home:{cid}", "message": {"message_id": 3, "text": "Предыдущий ответ",
+                        "chat": {"id": 101, "type": "private"}}}}
             ])
             with patch("run.Telegram", RecordingTelegram), patch("classdiary.app.today_in", return_value=date(2026, 10, 14)), patch("classdiary.group_interactive.today_in", return_value=date(2026, 10, 14)):
                 task = asyncio.create_task(run.serve(config))
                 try:
                     await asyncio.wait_for(ready.wait(), 5)
                     private = [p for m, p in wire if m == "sendMessage" and p["chat_id"] == 101]
-                    self.assertEqual(len(private), 3, "Initial menu, group command and group button each produce a new private message")
-                    self.assertTrue(all("Решить № 777" in p["text"] for p in private[1:]))
+                    self.assertEqual(len(private), 4, "Each typed command produces a new message")
+                    self.assertTrue(all("Решить № 777" in p["text"] for p in private[1:3]))
                     self.assertEqual({p["message_id"] for m, p in wire if m == "editMessageText"}, {3})
                     self.assertTrue(all("Решить № 777" not in p["text"] for m, p in wire if m == "sendMessage" and p["chat_id"] == -100))
                     group_text = "\n".join(p["text"] for m, p in wire if m == "sendMessage" and p["chat_id"] == -100)
@@ -141,9 +154,14 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("Парные огоньки", group_text)
                     self.assertTrue(all("Активность класса" not in p["text"] and "Парные огоньки" not in p["text"] for p in private))
                     self.assertTrue(any(m == "answerCallbackQuery" and "Отправлено новым" in p.get("text", "") for m, p in wire))
+                    self.assertTrue(any(m == "answerCallbackQuery" and p["callback_query_id"] == "another-user" and p["show_alert"] for m, p in wire))
+                    self.assertFalse(any(m == "sendMessage" and p["chat_id"] == 100 for m, p in wire))
+                    self.assertIn(("getChatMember", {"chat_id": -100, "user_id": 300}), wire)
+                    self.assertTrue(any(m == "sendMessage" and p["chat_id"] == 300 and "Ты в классе" in p["text"] for m, p in wire))
                     saved = Database(config.database)
                     self.assertEqual(saved.scalar("SELECT message_id FROM ui_panels WHERE user_id=101"), 3)
-                    self.assertEqual(saved.scalar("SELECT value FROM meta WHERE key='telegram_offset'"), "27")
+                    self.assertEqual(saved.scalar("SELECT value FROM meta WHERE key='telegram_offset'"), "31")
+                    self.assertEqual(saved.scalar("SELECT active FROM members WHERE class_id=? AND user_id=300", (cid,)), 1)
                     saved.close()
                 finally:
                     task.cancel()

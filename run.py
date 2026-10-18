@@ -27,6 +27,29 @@ def check():
     print("OK: Python, база данных и расписание корректны. BOT_TOKEN и сеть для этой проверки не нужны.")
 
 
+async def process_updates(app, updates, log, concurrency=8):
+    """Preserve each person's input order without making other users wait for it."""
+    groups = {}
+    for update in updates:
+        event = update.get("callback_query") or update.get("message") or {}
+        actor = event.get("from", {}).get("id")
+        key = ("user", actor) if actor is not None else ("update", update["update_id"])
+        groups.setdefault(key, []).append(update)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def handle(group):
+        async with semaphore:
+            for update in group:
+                try:
+                    await app.on_update(update)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("Update %s failed: %s", update["update_id"], type(exc).__name__)
+
+    await asyncio.gather(*(handle(group) for group in groups.values()))
+
+
 async def serve(config):
     log = logging.getLogger("classdiary")
     log.info("Открываем SQLite и проверяем возможность записи...")
@@ -42,10 +65,12 @@ async def serve(config):
         # Keep queued updates: homework messages sent while offline must not be discarded.
         await telegram.call("deleteWebhook", drop_pending_updates=False)
         await telegram.call("setMyCommands", commands=[
-            {"command": "menu", "description": "Главное меню"}, {"command": "hw", "description": "Общее ДЗ на завтра"},
+            {"command": "menu", "description": "Главное меню"}, {"command": "hw", "description": "ДЗ к ближайшему учебному дню"},
+            {"command": "progress", "description": "Проверить заполненность ДЗ"},
             {"command": "my", "description": "Личные записи на завтра"}, {"command": "schedule", "description": "Расписание недели"},
             {"command": "stats", "description": "Статистика сообщений"}, {"command": "cancel", "description": "Отменить ввод"},
             {"command": "pairs", "description": "Парные огоньки"}, {"command": "interactive", "description": "Интерактив класса"},
+            {"command": "invite", "description": "Пригласить группу в класс"},
             {"command": "groupcheck", "description": "Проверить работу в группе"},
             {"command": "help", "description": "Как пользоваться"}])
         log.info("Started @%s. Polling. Press Ctrl+C to stop.", app.username)
@@ -56,17 +81,11 @@ async def serve(config):
             try:
                 updates = await telegram.call("getUpdates", offset=offset, timeout=30, limit=50,
                                               allowed_updates=["message", "callback_query"])
-                for update in updates:
-                    if update["update_id"] < offset:
-                        continue
-                    try:
-                        await app.on_update(update)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        # Never print raw update payloads, private text or token-bearing URLs.
-                        log.error("Update %s failed: %s", update["update_id"], type(exc).__name__)
-                    offset = update["update_id"] + 1
+                pending = [update for update in updates if update["update_id"] >= offset]
+                if pending:
+                    await process_updates(app, pending, log)
+                    # Acknowledge only after every user in this batch has been processed.
+                    offset = max(update["update_id"] for update in pending) + 1
                     db.run("INSERT INTO meta VALUES('telegram_offset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(offset),))
                 failures = 0
             except TelegramError as exc:
@@ -92,7 +111,6 @@ def main():
     parser.add_argument("--check", action="store_true", help="Проверить проект без токена и сети")
     parser.add_argument("--backup", metavar="PATH", help="Сохранить резервную копию базы")
     args = parser.parse_args()
-    print(f"[ClassDiary 0.2.3] CLI started; Python {sys.version.split()[0]}", flush=True)
     if sys.version_info < (3, 11):
         print("Нужен Python 3.11 или новее.", file=sys.stderr)
         return 1
@@ -102,7 +120,7 @@ def main():
             return 0
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         logging.getLogger("classdiary").info("Читаем BOT_TOKEN и настройки запуска...")
-        config = Config.from_env()
+        config = Config.from_env(require_token=not args.backup)
         if args.backup:
             path = Path(args.backup).resolve()
             if path == config.database.resolve():

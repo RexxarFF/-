@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS message_events (
  user_id INTEGER NOT NULL, day TEXT NOT NULL, PRIMARY KEY(chat_id,message_id)
 );
 CREATE INDEX IF NOT EXISTS events_member ON message_events(class_id,user_id,day);
+CREATE INDEX IF NOT EXISTS events_class_day ON message_events(class_id,day,user_id);
+CREATE INDEX IF NOT EXISTS delivery_pending ON deliveries(state,retry_after,id);
 CREATE TABLE IF NOT EXISTS pairs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
  user_a INTEGER NOT NULL, user_b INTEGER NOT NULL, requester INTEGER NOT NULL, accepted INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +100,34 @@ CREATE TABLE IF NOT EXISTS ui_panels (
  user_id INTEGER PRIMARY KEY REFERENCES users(id), message_id INTEGER,
  media_messages TEXT NOT NULL DEFAULT '[]', temporary_messages TEXT NOT NULL DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS group_panels (
+ chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+ class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+ owner_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ PRIMARY KEY(chat_id,message_id)
+);
+CREATE TABLE IF NOT EXISTS class_invites (
+ token TEXT PRIMARY KEY, class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+ group_id INTEGER NOT NULL, created_by INTEGER NOT NULL REFERENCES users(id),
+ expires_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, message_id INTEGER,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS homework_exemptions (
+ class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+ subject_key TEXT NOT NULL, subject TEXT NOT NULL,
+ PRIMARY KEY(class_id,subject_key)
+);
+CREATE TABLE IF NOT EXISTS school_weekends (
+ class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+ weekday INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 5), PRIMARY KEY(class_id,weekday)
+);
+CREATE TABLE IF NOT EXISTS school_breaks (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+ start_on TEXT NOT NULL, end_on TEXT NOT NULL, title TEXT NOT NULL,
+ created_by INTEGER NOT NULL REFERENCES users(id), CHECK(start_on<=end_on)
+);
+CREATE INDEX IF NOT EXISTS breaks_class_dates ON school_breaks(class_id,start_on,end_on);
 CREATE TABLE IF NOT EXISTS audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, class_id INTEGER NOT NULL, actor INTEGER NOT NULL,
  action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -114,6 +144,12 @@ class Database:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, timeout=10, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
+        # Reject a newer database before running any schema changes.
+        if self.scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"):
+            version = self.scalar("SELECT value FROM meta WHERE key='schema_version'")
+            if version is not None and version != "1":
+                self.conn.close()
+                raise RuntimeError("Версия базы не поддерживается этим выпуском. Сделайте резервную копию.")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=10000")
         self.conn.execute("PRAGMA journal_mode=WAL")

@@ -23,6 +23,7 @@ class PanelTelegram:
         self.transport, self.db = transport, db
         self.context = ContextVar("private_panel", default=None)
         self.pages = {}
+        self.page_history = {}
 
     async def call(self, method, **payload):
         result = await self.transport.call(method, **payload)
@@ -40,6 +41,14 @@ class PanelTelegram:
 
     def row(self, uid):
         return self.db.one("SELECT * FROM ui_panels WHERE user_id=?", (uid,))
+
+    def access_stamp(self, uid):
+        members = self.db.all("SELECT m.class_id,c.owner_id,c.interactive FROM members m JOIN classes c ON c.id=m.class_id "
+                              "WHERE m.user_id=? AND m.active=1 ORDER BY m.class_id", (uid,))
+        roles = self.db.all("SELECT mr.class_id,r.id,r.permissions FROM member_roles mr JOIN roles r ON r.id=mr.role_id "
+                            "AND r.class_id=mr.class_id WHERE mr.user_id=? ORDER BY mr.class_id,r.id", (uid,))
+        audiences = self.db.all("SELECT class_id,audience_id FROM member_audiences WHERE user_id=? ORDER BY class_id,audience_id", (uid,))
+        return members, roles, audiences
 
     def remember(self, uid, **values):
         self.db.run("INSERT OR IGNORE INTO ui_panels(user_id) VALUES(?)", (uid,))
@@ -91,39 +100,64 @@ class PanelTelegram:
         return result
 
     async def present(self, uid, text, keyboard=None, **extra):
+        self.cleanup()
         parts = list(chunks(text)) or ["Нет данных."]
-        if len(parts) > 1:
+        rows = (keyboard or {}).get("inline_keyboard", [])
+        footer = rows[-1:] if sum(map(len, rows)) > 88 else []
+        if footer:
+            rows = rows[:-1]
+        limit = 88 - sum(map(len, footer))
+        keyboard_pages, page, count = [], [], 0
+        for row in rows:
+            if page and count + len(row) > limit:
+                keyboard_pages.append(page + footer)
+                page, count = [], 0
+            page.append(row)
+            count += len(row)
+        keyboard_pages.append(page + footer)
+        total = max(len(parts), len(keyboard_pages))
+        if total > 1:
             nonce = secrets.token_hex(4)
             memberships = {row["class_id"] for row in self.db.all("SELECT class_id FROM members WHERE user_id=? AND active=1", (uid,))}
-            self.pages[uid] = dict(nonce=nonce, pages=parts, keyboard=keyboard, created=time.monotonic(), memberships=memberships)
+            # Keep every control reachable, even when the list has over 100 tasks.
+            self.pages[uid] = dict(nonce=nonce, pages=parts, keyboard=keyboard, total=total,
+                                   keyboards=keyboard_pages, created=time.monotonic(), memberships=memberships,
+                                   access=self.access_stamp(uid))
+            self.page_history[uid, nonce] = self.pages[uid]
+            own = [key for key in self.page_history if key[0] == uid]
+            for key in own[:-12]:
+                del self.page_history[key]
+            while len(self.page_history) > 500:
+                del self.page_history[next(iter(self.page_history))]
             return await self.show_page(uid, nonce, 0)
         self.pages.pop(uid, None)
         return await self.display(uid, parts[0], keyboard, **extra)
 
     async def show_page(self, uid, nonce, index):
-        cache = self.pages.get(uid)
+        cache = self.page_history.get((uid, nonce))
         if not cache or cache["nonce"] != nonce or time.monotonic()-cache["created"] > 3600:
-            raise ValueError("Этот список устарел. Откройте раздел заново через /menu.")
-        if not 0 <= index < len(cache["pages"]):
+            raise ValueError("Этот список устарел. Открой раздел заново через /menu.")
+        if not 0 <= index < cache["total"]:
             raise ValueError("Страница не найдена.")
         memberships = {row["class_id"] for row in self.db.all("SELECT class_id FROM members WHERE user_id=? AND active=1", (uid,))}
-        if not cache["memberships"].issubset(memberships):
+        if not cache["memberships"].issubset(memberships) or cache["access"] != self.access_stamp(uid):
             self.pages.pop(uid, None)
-            raise ValueError("Доступ к классу изменился. Откройте /menu.")
+            self.page_history.pop((uid, nonce), None)
+            raise ValueError("Доступ к классу изменился. Открой /menu.")
         nav = []
         if index:
             nav.append(button("◀️", f"uipage:{nonce}:{index-1}"))
-        nav.append(button(f"{index+1}/{len(cache['pages'])}", "noop"))
-        if index+1 < len(cache["pages"]):
+        nav.append(button(f"{index+1}/{cache['total']}", "noop"))
+        if index+1 < cache["total"]:
             nav.append(button("▶️", f"uipage:{nonce}:{index+1}"))
-        rows = (cache["keyboard"] or {}).get("inline_keyboard", [])
+        rows = cache["keyboards"][min(index, len(cache["keyboards"])-1)]
         markup = {"inline_keyboard": [nav] + rows}
-        return await self.display(uid, cache["pages"][index], markup)
+        return await self.display(uid, cache["pages"][min(index, len(cache["pages"])-1)], markup)
 
     async def display(self, uid, text, keyboard=None, **extra):
         row = self.row(uid)
         context = self.context.get()
-        mid = row["message_id"] if row and row["message_id"] else (context.adopt_message_id if context else None)
+        mid = (context.adopt_message_id if context else None) or (row["message_id"] if row else None)
         fresh = bool(context and context.fresh_message)
         markup = keyboard if keyboard is not None else {"inline_keyboard": []}
         if mid and not fresh:
@@ -147,12 +181,7 @@ class PanelTelegram:
             self.remember(uid, message_id=result["message_id"])
             if context:
                 context.fresh_message = False
-            # Replace the old navigation panel only after the new reply was accepted by Telegram.
-            if fresh and mid and mid != result["message_id"]:
-                try:
-                    await self.transport.call("deleteMessage", chat_id=uid, message_id=mid)
-                except TelegramError:
-                    pass
+                context.adopt_message_id = result["message_id"]
         return result
 
     async def close_keyboard(self, uid):
@@ -173,3 +202,4 @@ class PanelTelegram:
     def cleanup(self):
         now = time.monotonic()
         self.pages = {uid: data for uid, data in self.pages.items() if now-data["created"] <= 3600}
+        self.page_history = {key: data for key, data in self.page_history.items() if now-data["created"] <= 3600}

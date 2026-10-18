@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from .config import get_timezone
 from .db import Database
-from .schedule import streak, validate_lessons
+from .schedule import homework_blocks, parse_date, streak, subject_key, validate_lessons
 
 PERMISSIONS = {
     "homework": "Общее ДЗ", "schedule": "Расписание и замены", "announcements": "Объявления",
@@ -40,9 +40,9 @@ class Diary:
         classroom = self.db.one("SELECT c.* FROM classes c JOIN members m ON m.class_id=c.id "
                                 "WHERE c.id=? AND m.user_id=? AND m.active=1", (class_id, user_id))
         if not classroom:
-            raise AccessDenied("Нет доступа к этому классу. Попросите владельца добавить вас и запустите бота в личке.")
+            raise AccessDenied("Нет доступа к этому классу. Попроси владельца добавить тебя и запусти бота в личке.")
         if permission and classroom["owner_id"] != user_id and permission not in self.permissions(class_id, user_id):
-            raise AccessDenied("Для этого действия у вас нет прав в этом классе.")
+            raise AccessDenied("Для этого действия у тебя нет прав в этом классе.")
         return classroom
 
     def permissions(self, class_id, user_id):
@@ -87,7 +87,7 @@ class Diary:
     def add_members(self, class_id, actor, users):
         self.require(class_id, actor, "members")
         if len(users) > 50:
-            raise ValueError("Добавляйте до 50 участников за один раз.")
+            raise ValueError("Добавляй до 50 участников за один раз.")
         with self.db.transaction():
             for user in users:
                 uid = int(user.get("user_id", user.get("id", 0)))
@@ -111,6 +111,7 @@ class Diary:
             self.db.run("UPDATE users SET active_class=NULL WHERE id=? AND active_class=?", (target, class_id))
             self.db.run("DELETE FROM fsm WHERE user_id=?", (target,))
             self.db.run("DELETE FROM deliveries WHERE class_id=? AND recipient=? AND state='pending'", (class_id, target))
+            self.db.run("UPDATE class_invites SET active=0 WHERE class_id=?", (class_id,))
             self.db.audit(class_id, actor, "members.remove", str(target))
 
     def members(self, class_id, actor):
@@ -126,7 +127,7 @@ class Diary:
         self.require(class_id, actor, "roles")
         name = name.strip()
         if not 1 <= len(name) <= 50 or not set(permissions).issubset(PERMISSIONS):
-            raise ValueError("Проверьте название роли и выбранные права.")
+            raise ValueError("Проверь название роли и выбранные права.")
         with self.db.transaction():
             if role_id is None:
                 role_id = self.db.run("INSERT INTO roles(class_id,name,permissions) VALUES(?,?,?)",
@@ -178,8 +179,8 @@ class Diary:
 
     def replace_weekday(self, class_id, actor, weekday, rows):
         self.require(class_id, actor, "schedule")
-        if not 0 <= weekday <= 6:
-            raise ValueError("Неверный день недели.")
+        if not 0 <= weekday <= 5:
+            raise ValueError("Выбери день с понедельника по субботу. Воскресенье — выходной.")
         rows = validate_lessons(rows)
         with self.db.transaction():
             old = self.db.all("SELECT * FROM lessons WHERE class_id=? AND weekday=? AND archived=0", (class_id, weekday))
@@ -196,6 +197,8 @@ class Diary:
 
     def set_override(self, class_id, actor, day: date, rows):
         self.require(class_id, actor, "schedule")
+        if day.weekday() == 6:
+            raise ValueError("На воскресенье расписание не создаётся.")
         rows = validate_lessons(rows)
         with self.db.transaction():
             for row in rows:
@@ -209,6 +212,8 @@ class Diary:
         self.db.run("DELETE FROM day_overrides WHERE class_id=? AND day=?", (class_id, day.isoformat()))
 
     def lessons_on(self, class_id, day: date):
+        if self.day_off_reason(class_id, day):
+            return []
         override = self.db.scalar("SELECT lessons FROM day_overrides WHERE class_id=? AND day=?", (class_id, day.isoformat()))
         if override is not None:
             rows = json.loads(override)
@@ -229,13 +234,139 @@ class Diary:
         return [r for r in rows if not selected or r["audience_id"] == 0 or r["audience_id"] in selected]
 
     def next_lesson(self, class_id, assigned: date, subject, audience_id):
-        for i in range(1, 371):
+        calendar = self._calendar_snapshot(class_id)
+        key = subject_key(subject)
+
+        def matches_subject(row):
+            return subject_key(row["subject"]) == key and (not audience_id or row["audience_id"] in (0, audience_id))
+
+        if not any(matches_subject(row) for days in calendar[:2] for rows in days.values() for row in rows):
+            return None, 0
+        for i in range(1, 741):
             day = assigned + timedelta(days=i)
-            matches = [r for r in self.lessons_on(class_id, day) if r["subject"].casefold() == subject.casefold()
-                       and (not audience_id or r["audience_id"] in (0, audience_id))]
+            matches = [r for r in self._calendar_lessons(calendar, day) if matches_subject(r)]
             if matches:
                 return day, matches[0]["position"]
         return None, 0
+
+    def _calendar_snapshot(self, class_id):
+        """Read once per search so holidays and empty schedules cost no SQL per day."""
+        week = {}
+        for row in self.db.all("SELECT * FROM lessons WHERE class_id=? AND archived=0 ORDER BY position,audience_id", (class_id,)):
+            week.setdefault(row["weekday"], []).append(row)
+        overrides = {r["day"]: json.loads(r["lessons"]) for r in self.db.all(
+            "SELECT day,lessons FROM day_overrides WHERE class_id=?", (class_id,))}
+        weekends = {6} | {r["weekday"] for r in self.db.all("SELECT weekday FROM school_weekends WHERE class_id=?", (class_id,))}
+        breaks = self.db.all("SELECT start_on,end_on FROM school_breaks WHERE class_id=?", (class_id,))
+        return week, overrides, weekends, breaks
+
+    @staticmethod
+    def _calendar_is_off(snapshot, day):
+        _, _, weekends, breaks = snapshot
+        key = day.isoformat()
+        return day.weekday() in weekends or any(r["start_on"] <= key <= r["end_on"] for r in breaks)
+
+    @classmethod
+    def _calendar_lessons(cls, snapshot, day):
+        if cls._calendar_is_off(snapshot, day):
+            return []
+        week, overrides, _, _ = snapshot
+        return overrides.get(day.isoformat(), week.get(day.weekday(), []))
+
+    def day_off_reason(self, class_id, day):
+        if day.weekday() == 6:
+            return "Выходной"
+        if self.db.scalar("SELECT 1 FROM school_weekends WHERE class_id=? AND weekday=?", (class_id, day.weekday())):
+            return "Выходной"
+        return self.db.scalar("SELECT title FROM school_breaks WHERE class_id=? AND start_on<=? AND end_on>=? ORDER BY id DESC LIMIT 1",
+                              (class_id, day.isoformat(), day.isoformat()))
+
+    def next_school_day(self, class_id, after, direction=1):
+        if direction not in (-1, 1):
+            raise ValueError("Неверное направление даты.")
+        calendar = self._calendar_snapshot(class_id)
+        has_schedule = any(calendar[0].values()) or any(calendar[1].values())
+        fallback = None
+        for offset in range(1, 741):
+            day = after+timedelta(days=direction*offset)
+            if self._calendar_is_off(calendar, day):
+                continue
+            fallback = fallback or day
+            if not has_schedule:
+                return fallback
+            if self._calendar_lessons(calendar, day):
+                return day
+        # An empty, newly created class still has a usable menu and calendar.
+        if fallback:
+            return fallback
+        day = after+timedelta(days=direction)
+        return day+timedelta(days=direction) if day.weekday() == 6 else day
+
+    def resolve_school_date(self, class_id, value, today):
+        value = value.strip().casefold()
+        return self.next_school_day(class_id, today) if value in ("завтра", "tomorrow") else parse_date(value, today)
+
+    def toggle_school_weekend(self, class_id, actor, weekday):
+        self.require(class_id, actor, "schedule")
+        if not 0 <= weekday <= 5:
+            raise ValueError("Воскресенье всегда выходной. Выбери другой день.")
+        if self.db.scalar("SELECT 1 FROM school_weekends WHERE class_id=? AND weekday=?", (class_id, weekday)):
+            self.db.run("DELETE FROM school_weekends WHERE class_id=? AND weekday=?", (class_id, weekday))
+        else:
+            if self.db.scalar("SELECT COUNT(*) FROM school_weekends WHERE class_id=?", (class_id,)) >= 5:
+                raise ValueError("Оставь хотя бы один учебный день в неделе.")
+            self.db.run("INSERT INTO school_weekends VALUES(?,?)", (class_id, weekday))
+        self.db.audit(class_id, actor, "calendar.weekend", str(weekday))
+
+    def school_breaks(self, class_id, actor):
+        self.require(class_id, actor, "schedule")
+        return self.db.all("SELECT * FROM school_breaks WHERE class_id=? ORDER BY start_on DESC,id DESC", (class_id,))
+
+    def add_school_break(self, class_id, actor, start, end, title="Каникулы"):
+        self.require(class_id, actor, "schedule")
+        title = title.strip()
+        if end < start or (end-start).days > 365:
+            raise ValueError("Конец периода должен быть не раньше начала. Максимум — один год.")
+        if not 1 <= len(title) <= 80:
+            raise ValueError("Название периода: 1–80 символов.")
+        result = self.db.run("INSERT INTO school_breaks(class_id,start_on,end_on,title,created_by) VALUES(?,?,?,?,?)",
+                             (class_id, start.isoformat(), end.isoformat(), title, actor)).lastrowid
+        self.db.audit(class_id, actor, "calendar.break.add", str(result))
+        return result
+
+    def remove_school_break(self, class_id, actor, break_id):
+        self.require(class_id, actor, "schedule")
+        if self.db.run("DELETE FROM school_breaks WHERE id=? AND class_id=?", (break_id, class_id)).rowcount != 1:
+            raise ValueError("Период уже удалён или относится к другому классу.")
+        self.db.audit(class_id, actor, "calendar.break.remove", str(break_id))
+
+    def exempt_subjects(self, class_id):
+        return [r["subject"] for r in self.db.all("SELECT subject FROM homework_exemptions WHERE class_id=? ORDER BY subject", (class_id,))]
+
+    def subject_catalog(self, class_id, actor):
+        self.require(class_id, actor, "settings")
+        subjects = self.exempt_subjects(class_id)
+        subjects += [r["subject"] for r in self.db.all("SELECT DISTINCT subject FROM lessons WHERE class_id=? AND archived=0 AND weekday<6", (class_id,))]
+        for override in self.db.all("SELECT lessons FROM day_overrides WHERE class_id=?", (class_id,)):
+            subjects += [r["subject"] for r in json.loads(override["lessons"])]
+        return sorted({subject_key(s): s for s in subjects}.values(), key=subject_key)
+
+    def toggle_homework_exemption(self, class_id, actor, subject):
+        self.require(class_id, actor, "settings")
+        if subject_key(subject) not in {subject_key(s) for s in self.subject_catalog(class_id, actor)}:
+            raise ValueError("Выбери предмет из расписания класса.")
+        key = subject_key(subject)
+        if self.db.scalar("SELECT 1 FROM homework_exemptions WHERE class_id=? AND subject_key=?", (class_id, key)):
+            self.db.run("DELETE FROM homework_exemptions WHERE class_id=? AND subject_key=?", (class_id, key))
+        else:
+            self.db.run("INSERT INTO homework_exemptions VALUES(?,?,?)", (class_id, key, subject))
+        self.db.audit(class_id, actor, "homework.exemption", subject)
+
+    def homework_progress(self, class_id, actor, day):
+        self.require(class_id, actor, "homework")
+        assignments = self.db.all("SELECT * FROM assignments WHERE class_id=? AND owner_id=0 AND due_on=?", (class_id, day.isoformat()))
+        blocks = homework_blocks(assignments, self.lessons_on(class_id, day), self.exempt_subjects(class_id))
+        return dict(total=len(blocks), filled=sum(b["status"] != "missing" for b in blocks), blocks=blocks)
 
     def existing_assignment(self, class_id, actor, owner_id, source_key, assigned):
         self.require(class_id, actor, "homework" if owner_id == 0 else None)
@@ -261,7 +392,7 @@ class Diary:
         subject = str(draft["subject"]).strip()
         audience = int(draft.get("audience_id", 0))
         if not subject or len(subject) > 80:
-            raise ValueError("Проверьте название предмета.")
+            raise ValueError("Проверь название предмета.")
         if audience and not self.db.scalar("SELECT 1 FROM audiences WHERE class_id=? AND id=?", (class_id, audience)):
             raise AccessDenied("Подгруппа из другого класса.")
         if no_homework:
@@ -274,7 +405,7 @@ class Diary:
             old = self.db.one("SELECT * FROM assignments WHERE class_id=? AND owner_id=? AND source_key=? AND assigned_on=?", key)
             revision = int(draft.get("revision", 0))
             if (old and old["revision"] != revision) or (not old and revision):
-                raise Conflict("Задание уже изменили или удалили. Откройте урок заново, чтобы не затереть чужие правки.")
+                raise Conflict("Задание уже изменили или удалили. Открой урок заново, чтобы не затереть чужие правки.")
             values = (subject, audience, due.isoformat(), int(draft.get("due_position", 0)), body,
                       json.dumps(media, ensure_ascii=False), int(no_homework), actor)
             if old:
@@ -303,7 +434,7 @@ class Diary:
         if row["owner_id"] == 0:
             self.require(class_id, actor, "homework")
         if self.db.run("DELETE FROM assignments WHERE id=? AND revision=?", (assignment_id, revision)).rowcount != 1:
-            raise Conflict("Задание изменилось. Откройте его заново.")
+            raise Conflict("Задание изменилось. Открой его заново.")
         self.db.audit(class_id, actor, "assignment.delete", str(assignment_id))
 
     def assignments_on(self, class_id, actor, day, personal=False):
@@ -326,14 +457,62 @@ class Diary:
             self.db.run("INSERT INTO completions VALUES(?,?)", (assignment_id, actor))
 
     def bind_group(self, class_id, actor, group_id, title):
-        self.require(class_id, actor, "settings")
+        classroom = self.require(class_id, actor, "settings")
         if int(group_id) >= 0:
             raise ValueError("Нужна группа, а не личный чат.")
         other = self.db.scalar("SELECT id FROM classes WHERE group_id=? AND id<>?", (group_id, class_id))
         if other:
             raise Conflict("Эта группа уже привязана к другому классу.")
         self.db.run("UPDATE classes SET group_id=?,group_title=? WHERE id=?", (group_id, title[:150], class_id))
+        if classroom["group_id"] != group_id:
+            self.db.run("UPDATE class_invites SET active=0 WHERE class_id=?", (class_id,))
         self.db.audit(class_id, actor, "group.bind", str(group_id))
+
+    def create_group_invite(self, class_id, actor, now=None):
+        classroom = self.require(class_id, actor, "members")
+        if not classroom["group_id"]:
+            raise ValueError("Сначала привяжите группу в управлении классом.")
+        now = now or datetime.now(timezone.utc)
+        expires = (now.astimezone(timezone.utc)+timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        token = secrets.token_urlsafe(18)
+        with self.db.transaction():
+            self.db.run("UPDATE class_invites SET active=0 WHERE class_id=?", (class_id,))
+            self.db.run("INSERT INTO class_invites(token,class_id,group_id,created_by,expires_at) VALUES(?,?,?,?,?)",
+                        (token, class_id, classroom["group_id"], actor, expires))
+            self.db.audit(class_id, actor, "class_invite.create")
+        return self.group_invite(token, now)
+
+    def group_invite(self, token, now=None):
+        now = now or datetime.now(timezone.utc)
+        row = self.db.one("SELECT i.*,c.name,c.group_id AS current_group_id,c.group_title FROM class_invites i "
+                          "JOIN classes c ON c.id=i.class_id WHERE i.token=? AND i.active=1 AND i.expires_at>?",
+                          (token, now.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
+        if not row or row["group_id"] != row["current_group_id"]:
+            raise ValueError("Приглашение закрыто или истекло. Попроси ответственного опубликовать новое.")
+        try:
+            self.require(row["class_id"], row["created_by"], "members")
+        except AccessDenied:
+            raise ValueError("Приглашение закрыто. Попроси владельца класса опубликовать новое.") from None
+        return row
+
+    def close_group_invites(self, class_id, actor):
+        self.require(class_id, actor, "members")
+        self.db.run("UPDATE class_invites SET active=0 WHERE class_id=?", (class_id,))
+        self.db.audit(class_id, actor, "class_invite.close")
+
+    def join_group_invite(self, token, actor, verified_group_id):
+        with self.db.transaction():
+            invite = self.group_invite(token)
+            if invite["group_id"] != verified_group_id:
+                raise AccessDenied("Участие в нужной группе не подтверждено.")
+            if not self.db.scalar("SELECT started FROM users WHERE id=?", (actor,)):
+                raise AccessDenied("Сначала запустите бота в личке.")
+            self.db.run("INSERT INTO members(class_id,user_id,active) VALUES(?,?,1) ON CONFLICT(class_id,user_id) DO UPDATE SET active=1",
+                        (invite["class_id"], actor))
+            self.db.run("UPDATE users SET active_class=? WHERE id=?", (invite["class_id"], actor))
+            self.db.clear_state(actor)
+            self.db.audit(invite["class_id"], actor, "members.join_group_invite")
+        return invite["class_id"]
 
     def announce(self, class_id, actor, body, attachments):
         classroom = self.require(class_id, actor, "announcements")
@@ -406,10 +585,13 @@ class Diary:
         self.require(class_id, actor)
         self.require(class_id, target)
         if actor == target:
-            raise ValueError("Выберите другого участника.")
+            raise ValueError("Выбери другого участника.")
         a, b = sorted((actor, target))
+        existing = self.db.scalar("SELECT id FROM pairs WHERE class_id=? AND user_a=? AND user_b=?", (class_id, a, b))
+        if existing:
+            return existing
         if self.db.scalar("SELECT COUNT(*) FROM pairs WHERE class_id=? AND requester=? AND accepted=0", (class_id, actor)) >= 10:
-            raise ValueError("Сначала дождитесь ответов на отправленные приглашения.")
+            raise ValueError("Сначала дождись ответов на отправленные приглашения.")
         self.db.run("INSERT OR IGNORE INTO pairs(class_id,user_a,user_b,requester) VALUES(?,?,?,?)", (class_id, a, b, actor))
         return self.db.scalar("SELECT id FROM pairs WHERE class_id=? AND user_a=? AND user_b=?", (class_id, a, b))
 
@@ -418,6 +600,8 @@ class Diary:
         pair = self.db.one("SELECT * FROM pairs WHERE class_id=? AND id=?", (class_id, pair_id))
         if not pair or actor not in (pair["user_a"], pair["user_b"]) or actor == pair["requester"]:
             raise AccessDenied("Это приглашение предназначено другому участнику.")
+        if pair["accepted"]:
+            raise ValueError("Приглашение уже принято. Управлять огоньком можно в разделе «Огоньки».")
         other = pair["user_b"] if actor == pair["user_a"] else pair["user_a"]
         self.require(class_id, other)
         if accept:

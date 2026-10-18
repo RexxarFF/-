@@ -53,6 +53,20 @@ class SendingTests(unittest.IsolatedAsyncioTestCase):
 
         self.client._sleep = sleep
 
+    async def test_idle_chat_locks_are_released_after_sending(self):
+        with patch.object(self.client, "_request", return_value={"message_id": 1}):
+            for chat_id in range(100, 110):
+                await self.client.send(chat_id, "Текст")
+        self.assertEqual(len(self.client._chat_locks), 0)
+
+    async def test_expired_chat_rate_timestamps_are_pruned(self):
+        self.client._chat_last[99] = self.now - 400
+        self.client._last_cleanup = self.now - 400
+        with patch.object(self.client, "_request", return_value={"message_id": 1}):
+            await self.client.send(101, "Текст")
+        self.assertNotIn(99, self.client._chat_last)
+        self.assertIn(101, self.client._chat_last)
+
     async def test_consecutive_outgoing_messages_respect_private_and_group_intervals(self):
         sent = []
 

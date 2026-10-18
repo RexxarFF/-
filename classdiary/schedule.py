@@ -5,6 +5,24 @@ from datetime import date, datetime, timedelta
 
 DAYS = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье")
 SHORT_DAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+SCHOOL_DAYS = DAYS[:6]
+
+
+def subject_key(subject):
+    return " ".join(subject.casefold().replace("ё", "е").split())
+
+
+def homework_blocks(assignments, lessons, exemptions=()):
+    """One status per scheduled lesson/subgroup; no automatic assignment records."""
+    exempt = {subject_key(s) for s in exemptions}
+    blocks = []
+    for lesson in lessons:
+        matches = [a for a in assignments if subject_key(a["subject"]) == subject_key(lesson["subject"])
+                   and a["due_position"] in (0, lesson["position"])
+                   and (a["audience_id"] == lesson["audience_id"] or not a["audience_id"] or not lesson["audience_id"])]
+        status = "recorded" if matches else "exempt" if subject_key(lesson["subject"]) in exempt else "missing"
+        blocks.append(dict(lesson=lesson, assignments=matches, status=status))
+    return blocks
 
 
 def parse_date(value: str, today: date) -> date:
@@ -37,7 +55,7 @@ def validate_lesson(row: dict) -> dict:
     if not subject or len(subject) > 80 or len(audience) > 60 or len(room) > 30:
         raise ValueError("Предмет: 1–80 символов; подгруппа: до 60; кабинет: до 30.")
     if bool(start) != bool(end):
-        raise ValueError("Укажите и начало, и конец урока.")
+        raise ValueError("Укажи и начало, и конец урока.")
     for clock in (start, end):
         if clock and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", clock):
             raise ValueError("Время указывается как 09:00–09:45.")
@@ -56,7 +74,7 @@ def validate_lessons(rows: list[dict]) -> list[dict]:
         if key in seen:
             raise ValueError("Урок с таким номером и подгруппой уже есть.")
         if (row["position"], "") in seen or (not key[1] and any(p == key[0] for p, _ in seen)):
-            raise ValueError("В одном уроке используйте либо общую строку, либо отдельные подгруппы.")
+            raise ValueError("В одном уроке используй либо общую строку, либо отдельные подгруппы.")
         seen.add(key)
     return sorted(result, key=lambda row: (row["position"], row["audience"]))
 
@@ -76,14 +94,14 @@ def parse_day(text: str) -> list[dict]:
         try:
             position = int(parts[0])
         except ValueError:
-            raise ValueError(f"Строка {number}: сначала укажите номер урока.") from None
+            raise ValueError(f"Строка {number}: сначала укажи номер урока.") from None
         time = re.split(r"\s*[-–—]\s*", parts[3]) if parts[3] else ["", ""]
         if len(time) != 2:
             raise ValueError(f"Строка {number}: время в формате 09:00-09:45.")
         rows.append(dict(position=position, subject=parts[1], audience=parts[2],
                          starts=time[0], ends=time[1], room=parts[4]))
     if not rows:
-        raise ValueError("Пришлите уроки или слово «выходной».")
+        raise ValueError("Пришли уроки или слово «выходной».")
     return validate_lessons(rows)
 
 

@@ -4,7 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from classdiary.db import Database
@@ -65,6 +65,41 @@ class RetentionTests(unittest.TestCase):
 
 
 class UpgradeTests(unittest.TestCase):
+    def test_released_024_database_keeps_panels_invites_and_accepts_new_settings(self):
+        schema = (Path(__file__).parent / "fixtures" / "schema_v024.sql").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"diary.sqlite3"
+            old = sqlite3.connect(path)
+            old.executescript(schema)
+            old.execute("INSERT INTO meta VALUES('schema_version','1')")
+            old.execute("INSERT INTO users(id,name,started,active_class) VALUES(100,'Владелец',1,1)")
+            old.execute("INSERT INTO classes(id,name,owner_id,timezone,invite_token,group_id) VALUES(1,'9Б',100,'Europe/Moscow','token',-100)")
+            old.execute("INSERT INTO members VALUES(1,100,1)")
+            old.execute("INSERT INTO ui_panels(user_id,message_id) VALUES(100,123)")
+            old.execute("INSERT INTO group_panels(chat_id,message_id,class_id,owner_id) VALUES(-100,456,1,100)")
+            old.execute("INSERT INTO class_invites(token,class_id,group_id,created_by,expires_at) VALUES('common',1,-100,100,'2099-01-01 00:00:00')")
+            old.execute("INSERT INTO lessons(class_id,weekday,position,subject) VALUES(1,0,1,'Физкультура')")
+            old.execute("INSERT INTO lessons(class_id,weekday,position,subject) VALUES(1,6,1,'Старый воскресный урок')")
+            old.commit()
+            old.close()
+            db = Database(path)
+            diary = Diary(db)
+            diary.toggle_homework_exemption(1, 100, "Физкультура")
+            diary.toggle_school_weekend(1, 100, 5)
+            diary.add_school_break(1, 100, date(2026, 10, 19), date(2026, 10, 24), "Осенние каникулы")
+            db.close()
+            db = Database(path)
+            diary = Diary(db)
+            self.assertEqual(db.scalar("SELECT message_id FROM ui_panels WHERE user_id=100"), 123)
+            self.assertEqual(db.scalar("SELECT owner_id FROM group_panels WHERE message_id=456"), 100)
+            self.assertEqual(diary.group_invite("common")["class_id"], 1)
+            self.assertEqual(diary.exempt_subjects(1), ["Физкультура"])
+            self.assertEqual(diary.next_school_day(1, date(2026, 10, 17)), date(2026, 10, 26))
+            self.assertEqual(diary.lessons_on(1, date(2026, 10, 18)), [])
+            self.assertEqual(db.scalar("PRAGMA integrity_check"), "ok")
+            self.assertEqual(db.all("PRAGMA foreign_key_check"), [])
+            db.close()
+
     def test_released_011_database_upgrades_without_losing_class_or_records(self):
         schema = (Path(__file__).parent / "fixtures" / "schema_v011.sql").read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as folder:
@@ -96,10 +131,14 @@ class UpgradeTests(unittest.TestCase):
                 assigned_on="2026-10-16", subject="Личное", audience_id=0, due_on="2026-10-17", due_position=0,
                 body="Запись после обновления", attachments=[], no_homework=False, revision=0))
             self.assertTrue(db.scalar("SELECT created_at FROM assignments WHERE id=?", (new,)))
+            invite = diary.create_group_invite(1, 100)
+            db.run("INSERT INTO group_panels(chat_id,message_id,class_id,owner_id) VALUES(-100,321,1,100)")
             db.close()
             # Applying the migration twice must be harmless.
             db = Database(path)
             self.assertEqual(db.scalar("SELECT COUNT(*) FROM assignments"), 2)
+            self.assertEqual(Diary(db).group_invite(invite["token"])["class_id"], 1)
+            self.assertEqual(db.scalar("SELECT owner_id FROM group_panels WHERE message_id=321"), 100)
             db.run("INSERT INTO ui_panels(user_id,message_id) VALUES(100,123)")
             self.assertEqual(db.scalar("PRAGMA integrity_check"), "ok")
             self.assertEqual(db.all("PRAGMA foreign_key_check"), [])
